@@ -2,7 +2,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "hardware/clocks.h"
 #include "hardware/spi.h"
+#include "pico/multicore.h"
 #include "pico/stdlib.h"
 
 #include "NEN-project/assets.h"
@@ -36,6 +38,13 @@ static const uint8_t LED_PINS[IO_COUNT] = {14, 12, 8, 4, 2};
 static uint8_t g_last_event_num = 0;
 static bool g_last_event_step_on = false;
 static bool g_have_event = false;
+
+typedef enum
+{
+    DEBUG_PAGE_GAME = 0,
+    DEBUG_PAGE_CORE = 1,
+    DEBUG_PAGE_COUNT = 2,
+} debug_page_t;
 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -337,13 +346,24 @@ static void st7789_draw_debug_cell(uint8_t col, uint8_t row, const char *text, u
                      text_color);
 }
 
-static void draw_debug_screen(const player_t *camera,
-                              const map_t *map,
-                              const dialogue_t *dialogue,
-                              uint32_t buttons,
-                              bool debug_button,
-                              uint32_t fps,
-                              uint32_t frame_ms)
+static const char *build_arch_name(void)
+{
+#if defined(__riscv)
+    return "RISCV";
+#elif defined(__arm__) || defined(__thumb__)
+    return "ARM";
+#else
+    return "UNK";
+#endif
+}
+
+static void draw_debug_page_game(const player_t *camera,
+                                 const map_t *map,
+                                 const dialogue_t *dialogue,
+                                 uint32_t buttons,
+                                 bool debug_button,
+                                 uint32_t fps,
+                                 uint32_t frame_ms)
 {
     char line[20];
     int16_t x_whole;
@@ -354,7 +374,7 @@ static void draw_debug_screen(const player_t *camera,
     fx_to_whole_hundredths(camera->posX, &x_whole, &x_frac);
     fx_to_whole_hundredths(camera->posY, &y_whole, &y_frac);
 
-    st7789_draw_debug_cell(0, 0, "NEN DBG", rgb565(255, 230, 80));
+    st7789_draw_debug_cell(0, 0, "GAME PAGE", rgb565(255, 230, 80));
 
     snprintf(line, sizeof(line), "FPS %lu", (unsigned long)fps);
     st7789_draw_debug_cell(1, 0, line, rgb565(220, 220, 220));
@@ -391,6 +411,74 @@ static void draw_debug_screen(const player_t *camera,
 
     snprintf(line, sizeof(line), "M %ux%u", map->width, map->height);
     st7789_draw_debug_cell(2, 3, line, rgb565(200, 200, 200));
+}
+
+static void draw_debug_page_core(const player_t *camera,
+                                 const map_t *map,
+                                 bool debug_button,
+                                 uint32_t fps,
+                                 uint32_t frame_ms,
+                                 uint32_t uptime_ms)
+{
+    char line[20];
+    uint32_t sys_mhz = clock_get_hz(clk_sys) / 1000000u;
+
+    st7789_draw_debug_cell(0, 0, "CORE PAGE", rgb565(255, 230, 80));
+
+    snprintf(line, sizeof(line), "ARCH %s", build_arch_name());
+    st7789_draw_debug_cell(1, 0, line, rgb565(170, 240, 255));
+
+    snprintf(line, sizeof(line), "CNUM %u", get_core_num());
+    st7789_draw_debug_cell(2, 0, line, rgb565(170, 240, 255));
+
+    snprintf(line, sizeof(line), "SYS %luM", (unsigned long)sys_mhz);
+    st7789_draw_debug_cell(0, 1, line, rgb565(120, 255, 120));
+
+    snprintf(line, sizeof(line), "UP %lus", (unsigned long)(uptime_ms / 1000u));
+    st7789_draw_debug_cell(1, 1, line, rgb565(120, 255, 120));
+
+    snprintf(line, sizeof(line), "DBG %u", debug_button ? 1u : 0u);
+    st7789_draw_debug_cell(2, 1, line, rgb565(255, 220, 130));
+
+    snprintf(line, sizeof(line), "FPS %lu", (unsigned long)fps);
+    st7789_draw_debug_cell(0, 2, line, rgb565(220, 220, 220));
+
+    snprintf(line, sizeof(line), "FR %lums", (unsigned long)frame_ms);
+    st7789_draw_debug_cell(1, 2, line, rgb565(220, 220, 220));
+
+    snprintf(line, sizeof(line), "ANG %d", camera->angle);
+    st7789_draw_debug_cell(2, 2, line, rgb565(220, 190, 255));
+
+    if (g_have_event)
+        snprintf(line, sizeof(line), "EV %u%c", (unsigned)g_last_event_num, g_last_event_step_on ? '+' : '-');
+    else
+        snprintf(line, sizeof(line), "EV --");
+    st7789_draw_debug_cell(0, 3, line, rgb565(255, 120, 120));
+
+    snprintf(line, sizeof(line), "MAP %ux%u", map->width, map->height);
+    st7789_draw_debug_cell(1, 3, line, rgb565(200, 200, 200));
+
+    snprintf(line, sizeof(line), "PG 2/%u", (unsigned)DEBUG_PAGE_COUNT);
+    st7789_draw_debug_cell(2, 3, line, rgb565(255, 190, 120));
+}
+
+static void draw_debug_screen(debug_page_t page,
+                              const player_t *camera,
+                              const map_t *map,
+                              const dialogue_t *dialogue,
+                              uint32_t buttons,
+                              bool debug_button,
+                              uint32_t fps,
+                              uint32_t frame_ms,
+                              uint32_t uptime_ms)
+{
+    if (page == DEBUG_PAGE_CORE)
+    {
+        draw_debug_page_core(camera, map, debug_button, fps, frame_ms, uptime_ms);
+        return;
+    }
+
+    draw_debug_page_game(camera, map, dialogue, buttons, debug_button, fps, frame_ms);
 }
 
 static void on_map_event(uint8_t param1, uint8_t param2)
@@ -446,6 +534,9 @@ int main(void)
     MapEventCallback = on_map_event;
 
     bool prev_use = false;
+    bool prev_debug_button = false;
+    debug_page_t debug_page = DEBUG_PAGE_GAME;
+    uint32_t last_debug_toggle_ms = 0;
     uint32_t last_debug_draw_ms = 0;
 
     while (true)
@@ -455,6 +546,17 @@ int main(void)
 
         uint32_t button_mask = read_buttons_mask();
         bool debug_button = read_debug_button();
+        bool force_debug_redraw = false;
+
+        // Toggle debug page on GP28 rising edge with simple debounce.
+        if (debug_button && !prev_debug_button && (frame_start_ms - last_debug_toggle_ms) >= 180u)
+        {
+            debug_page = (debug_page == DEBUG_PAGE_GAME) ? DEBUG_PAGE_CORE : DEBUG_PAGE_GAME;
+            last_debug_toggle_ms = frame_start_ms;
+            force_debug_redraw = true;
+        }
+        prev_debug_button = debug_button;
+
         buttons_t buttons = buttons_from_mask(button_mask);
 
         MoveCamera(&camera, current_map, buttons, &current_dialogue);
@@ -490,12 +592,20 @@ int main(void)
 
         millis = frame_end_ms;
 
-        if (frame_end_ms - last_debug_draw_ms >= 120u)
+        if (force_debug_redraw || (frame_end_ms - last_debug_draw_ms >= 120u))
         {
-            draw_debug_screen(&camera, current_map, current_dialogue, button_mask, debug_button, fps, frame_len_ms);
+            draw_debug_screen(debug_page,
+                              &camera,
+                              current_map,
+                              current_dialogue,
+                              button_mask,
+                              debug_button,
+                              fps,
+                              frame_len_ms,
+                              frame_end_ms);
             last_debug_draw_ms = frame_end_ms;
         }
 
-        sleep_ms(1);
+        //sleep_ms(1);
     }
 }
