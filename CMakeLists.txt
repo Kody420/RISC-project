@@ -37,11 +37,11 @@ pico_sdk_init()
 
 add_executable(RISC-project
     RISC-project.c
-    third_party/NEN-project/fx8.c
-    third_party/NEN-project/raycasting.c
-    third_party/NEN-project/HUDStuff.c
-    third_party/NEN-project/assets.c
-    third_party/NEN-project/dogm128_fast.c
+    NEN-project/fx8.c
+    NEN-project/raycasting.c
+    NEN-project/HUDStuff.c
+    NEN-project/assets.c
+    NEN-project/dogm128_fast.c
     )
 
 pico_set_program_name(RISC-project "RISC-project")
@@ -58,7 +58,7 @@ target_link_libraries(RISC-project
 # Add the standard include files to the build
 target_include_directories(RISC-project PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}
-    ${CMAKE_CURRENT_LIST_DIR}/third_party/NEN-project
+    ${CMAKE_CURRENT_LIST_DIR}/NEN-project
 )
 
 # Add any user requested libraries

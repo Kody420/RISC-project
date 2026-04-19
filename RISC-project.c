@@ -5,10 +5,10 @@
 #include "hardware/spi.h"
 #include "pico/stdlib.h"
 
-#include "third_party/NEN-project/assets.h"
-#include "third_party/NEN-project/HUDStuff.h"
-#include "third_party/NEN-project/raycasting.h"
-#include "third_party/NEN-project/utils.h"
+#include "NEN-project/assets.h"
+#include "NEN-project/HUDStuff.h"
+#include "NEN-project/raycasting.h"
+#include "NEN-project/utils.h"
 
 volatile millis_t millis = 0;
 
