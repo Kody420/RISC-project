@@ -363,7 +363,7 @@ static void draw_debug_page_game(const player_t *camera,
                                  uint32_t buttons,
                                  bool debug_button,
                                  uint32_t fps,
-                                 uint32_t frame_ms)
+                                 uint32_t frame_us)
 {
     char line[20];
     int16_t x_whole;
@@ -379,7 +379,7 @@ static void draw_debug_page_game(const player_t *camera,
     snprintf(line, sizeof(line), "FPS %lu", (unsigned long)fps);
     st7789_draw_debug_cell(1, 0, line, rgb565(220, 220, 220));
 
-    snprintf(line, sizeof(line), "F %lums", (unsigned long)frame_ms);
+    snprintf(line, sizeof(line), "F %luus", (unsigned long)frame_us);
     st7789_draw_debug_cell(2, 0, line, rgb565(220, 220, 220));
 
     snprintf(line, sizeof(line), "BTN %02lX", (unsigned long)buttons);
@@ -417,8 +417,8 @@ static void draw_debug_page_core(const player_t *camera,
                                  const map_t *map,
                                  bool debug_button,
                                  uint32_t fps,
-                                 uint32_t frame_ms,
-                                 uint32_t uptime_ms)
+                                 uint32_t frame_us,
+                                 uint64_t uptime_us)
 {
     char line[20];
     uint32_t sys_mhz = clock_get_hz(clk_sys) / 1000000u;
@@ -434,7 +434,7 @@ static void draw_debug_page_core(const player_t *camera,
     snprintf(line, sizeof(line), "SYS %luM", (unsigned long)sys_mhz);
     st7789_draw_debug_cell(0, 1, line, rgb565(120, 255, 120));
 
-    snprintf(line, sizeof(line), "UP %lus", (unsigned long)(uptime_ms / 1000u));
+    snprintf(line, sizeof(line), "UP %lus", (unsigned long)(uptime_us / 1000000ull));
     st7789_draw_debug_cell(1, 1, line, rgb565(120, 255, 120));
 
     snprintf(line, sizeof(line), "DBG %u", debug_button ? 1u : 0u);
@@ -443,7 +443,7 @@ static void draw_debug_page_core(const player_t *camera,
     snprintf(line, sizeof(line), "FPS %lu", (unsigned long)fps);
     st7789_draw_debug_cell(0, 2, line, rgb565(220, 220, 220));
 
-    snprintf(line, sizeof(line), "FR %lums", (unsigned long)frame_ms);
+    snprintf(line, sizeof(line), "FR %luus", (unsigned long)frame_us);
     st7789_draw_debug_cell(1, 2, line, rgb565(220, 220, 220));
 
     snprintf(line, sizeof(line), "ANG %d", camera->angle);
@@ -469,16 +469,16 @@ static void draw_debug_screen(debug_page_t page,
                               uint32_t buttons,
                               bool debug_button,
                               uint32_t fps,
-                              uint32_t frame_ms,
-                              uint32_t uptime_ms)
+                              uint32_t frame_us,
+                              uint64_t uptime_us)
 {
     if (page == DEBUG_PAGE_CORE)
     {
-        draw_debug_page_core(camera, map, debug_button, fps, frame_ms, uptime_ms);
+        draw_debug_page_core(camera, map, debug_button, fps, frame_us, uptime_us);
         return;
     }
 
-    draw_debug_page_game(camera, map, dialogue, buttons, debug_button, fps, frame_ms);
+    draw_debug_page_game(camera, map, dialogue, buttons, debug_button, fps, frame_us);
 }
 
 static void on_map_event(uint8_t param1, uint8_t param2)
@@ -536,23 +536,24 @@ int main(void)
     bool prev_use = false;
     bool prev_debug_button = false;
     debug_page_t debug_page = DEBUG_PAGE_GAME;
-    uint32_t last_debug_toggle_ms = 0;
-    uint32_t last_debug_draw_ms = 0;
+    uint64_t last_debug_toggle_us = 0;
+    uint64_t last_debug_draw_us = 0;
 
     while (true)
     {
-        uint32_t frame_start_ms = to_ms_since_boot(get_absolute_time());
-        millis = frame_start_ms;
+        absolute_time_t frame_start = get_absolute_time();
+        uint64_t frame_start_us = to_us_since_boot(frame_start);
+        millis = to_ms_since_boot(frame_start);
 
         uint32_t button_mask = read_buttons_mask();
         bool debug_button = read_debug_button();
         bool force_debug_redraw = false;
 
         // Toggle debug page on GP28 rising edge with simple debounce.
-        if (debug_button && !prev_debug_button && (frame_start_ms - last_debug_toggle_ms) >= 180u)
+        if (debug_button && !prev_debug_button && (frame_start_us - last_debug_toggle_us) >= 180000ull)
         {
             debug_page = (debug_page == DEBUG_PAGE_GAME) ? DEBUG_PAGE_CORE : DEBUG_PAGE_GAME;
-            last_debug_toggle_ms = frame_start_ms;
+            last_debug_toggle_us = frame_start_us;
             force_debug_redraw = true;
         }
         prev_debug_button = debug_button;
@@ -575,24 +576,26 @@ int main(void)
         prev_use = buttons.use;
 
         bool dialogue_active = (current_dialogue != NULL);
-        HUD_DrawDialogue(&current_dialogue, use_pressed && dialogue_active);
         if (use_pressed && !dialogue_active)
             use_press_ms = millis;
 
         HUD_DrawItemPOV(&camera, use_press_ms + 200 > millis);
-        dogm128_refresh();
+        HUD_DrawDialogue(&current_dialogue, use_pressed && dialogue_active);
 
         set_LEDs(HUD_GetLEDHP(&camera));
 
-        uint32_t frame_end_ms = to_ms_since_boot(get_absolute_time());
-        uint32_t frame_len_ms = frame_end_ms - frame_start_ms;
-        if (frame_len_ms == 0)
-            frame_len_ms = 1;
-        uint32_t fps = 1000u / frame_len_ms;
+        absolute_time_t frame_end = get_absolute_time();
+        uint64_t frame_end_us = to_us_since_boot(frame_end);
+        uint32_t frame_len_us = (uint32_t)(frame_end_us - frame_start_us);
+        if (frame_len_us == 0)
+            frame_len_us = 1;
+        uint32_t fps = (1000000u + (frame_len_us / 2u)) / frame_len_us;
 
-        millis = frame_end_ms;
+        millis = to_ms_since_boot(frame_end);
 
-        if (force_debug_redraw || (frame_end_ms - last_debug_draw_ms >= 120u))
+        dogm128_refresh();
+
+        if (force_debug_redraw || (frame_end_us - last_debug_draw_us) >= 120000ull)
         {
             draw_debug_screen(debug_page,
                               &camera,
@@ -601,9 +604,9 @@ int main(void)
                               button_mask,
                               debug_button,
                               fps,
-                              frame_len_ms,
-                              frame_end_ms);
-            last_debug_draw_ms = frame_end_ms;
+                              frame_len_us,
+                              frame_end_us);
+            last_debug_draw_us = frame_end_us;
         }
 
         //sleep_ms(1);
