@@ -38,6 +38,9 @@ pico_sdk_init()
 
 add_executable(RISC-project
     RISC-project.c
+    st7789.c
+    u8g2_fonts/u8g2_font_t0_11_tr.c
+    u8g2_fonts/u8g2_font_inr16_mf.c
     NEN-project/fx8.c
     NEN-project/raycasting.c
     NEN-project/HUDStuff.c
