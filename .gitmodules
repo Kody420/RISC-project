@@ -1,3 +1,4 @@
 [submodule "NEN-project"]
 	path = NEN-project
 	url = https://github.com/machmar/NEN-project
+	branch = pico_port
