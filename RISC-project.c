@@ -374,6 +374,7 @@ int main(void)
     map_t *current_map = &WallDemoMap;
     const dialogue_t *current_dialogue = NULL;
     millis_t use_press_ms = 0;
+    static entity_t entities[MAX_ENTITIES];
 
     player_t camera;
     camera.posX = FX(current_map->DefaultSpwanPoint[0]);
@@ -388,6 +389,58 @@ int main(void)
     camera.currentItem = ITEM_HAND;
 
     MapEventCallback = on_map_event;
+
+entities[0].posX = FX(5);
+    entities[0].posY = FX(5);
+    entities[0].health = 100;
+    entities[0].sprite = &blobSprite;
+    entities[0].ratio = 0x00c0;
+    entities[0].heightOffset = FX(1);
+    entities[0].walking = 1;
+    entities[0].movementModifier = FX(1);
+    entities[0].lateralModifier = FX(1);
+    entities[0].hitDistance = FX(3);
+   
+    entities[1].posX = FX(8);
+    entities[1].posY = FX(8);
+    entities[1].health = 100;
+    entities[1].sprite = &ctyrruckaSprite;
+    entities[1].ratio = FX(1);
+    entities[1].heightOffset = FX(0);
+    entities[1].walking = 1;
+    entities[1].movementModifier = FX(2);  // 1.5625
+    entities[1].lateralModifier = FX(1);
+    entities[1].hitDistance = FX(4);
+
+    entities[2].posX = FX(3);
+    entities[2].posY = FX(3);
+    entities[2].health = 100;
+    entities[2].sprite = &chapadloSprite;
+    entities[2].ratio = 0X00C0;
+    entities[2].heightOffset = FX(0);
+    entities[2].walking = 1;
+    entities[2].movementModifier = 0X01C0;
+    entities[2].lateralModifier = FX(1);
+    entities[2].hitDistance = FX(6);
+
+    entities[3].posX = FX(6);
+    entities[3].posY = FX(2);
+    entities[3].health = 100;
+    entities[3].sprite = &soilderSprite;
+    entities[3].ratio = 0X0120;
+    entities[3].heightOffset = FX(0);
+    entities[3].walking = 1;
+    entities[3].movementModifier = FX(3);
+    entities[3].lateralModifier = FX(1);
+    entities[3].hitDistance = FX(20);
+    
+    entities[4].posX = FX(7);
+    entities[4].posY = FX(9);
+    entities[4].health = 100;
+    entities[4].sprite = &ctyrruckaSprite;
+    entities[4].ratio = FX(1);
+    entities[4].heightOffset = FX(0);
+    entities[4].walking = 0;
 
     bool prev_use = false;
     bool prev_debug_button = false;
@@ -409,6 +462,8 @@ int main(void)
 
         dogm128_clear();
         RenderFrame(&camera, current_map);
+        DrawEntities(&camera, entities, MAX_ENTITIES, dogm_fb, buttons);
+        EnemyAi(&camera, entities, MAX_ENTITIES, current_map);
 
         HUD_DrawBanner(current_map->Banner);
         HUD_DrawBorders();
