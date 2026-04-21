@@ -1,8 +1,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "hardware/clocks.h"
+#include "pico/critical_section.h"
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
 
@@ -87,8 +89,8 @@ static bool read_debug_button(void)
 static buttons_t buttons_from_mask(uint32_t mask)
 {
     buttons_t buttons = {0};
-    buttons.front = (mask & (1u << 0)) != 0;
-    buttons.back = (mask & (1u << 1)) != 0;
+    buttons.front = (mask & (1u << 1)) != 0;
+    buttons.back = (mask & (1u << 0)) != 0;
     buttons.use = (mask & (1u << 2)) != 0;
     buttons.left = (mask & (1u << 3)) != 0;
     buttons.right = (mask & (1u << 4)) != 0;
@@ -119,13 +121,76 @@ static const char *build_arch_name(void)
 #endif
 }
 
-static void draw_debug_page_game(const player_t *camera,
-                                 const map_t *map,
-                                 const dialogue_t *dialogue,
-                                 uint32_t buttons,
-                                 bool debug_button,
-                                 uint32_t fps,
-                                 uint32_t frame_us)
+typedef struct
+{
+    fx_t posX;
+    fx_t posY;
+    fx_t angle;
+    uint8_t health;
+    uint8_t kills;
+    item_t currentItem;
+} debug_camera_snapshot_t;
+
+typedef struct
+{
+    debug_page_t page;
+    debug_camera_snapshot_t camera;
+    uint8_t map_width;
+    uint8_t map_height;
+    uint8_t dialogue_active;
+    uint8_t debug_button;
+    uint8_t have_event;
+    uint8_t last_event_num;
+    uint8_t last_event_step_on;
+    uint32_t buttons;
+    uint32_t fps;
+    uint32_t actual_fps;
+    uint32_t frame_us;
+    uint64_t uptime_us;
+} debug_display_snapshot_t;
+
+static critical_section_t g_debug_snapshot_lock;
+static volatile uint32_t g_debug_snapshot_version = 0;
+static debug_display_snapshot_t g_debug_snapshot;
+
+static void publish_debug_snapshot(debug_page_t page,
+                                   const player_t *camera,
+                                   const map_t *map,
+                                   bool dialogue_active,
+                                   uint32_t buttons,
+                                   bool debug_button,
+                                   uint32_t fps,
+                                   uint32_t actual_fps,
+                                   uint32_t frame_us,
+                                   uint64_t uptime_us)
+{
+    critical_section_enter_blocking(&g_debug_snapshot_lock);
+
+    g_debug_snapshot.page = page;
+    g_debug_snapshot.camera.posX = camera->posX;
+    g_debug_snapshot.camera.posY = camera->posY;
+    g_debug_snapshot.camera.angle = camera->angle;
+    g_debug_snapshot.camera.health = camera->health;
+    g_debug_snapshot.camera.kills = camera->kills;
+    g_debug_snapshot.camera.currentItem = camera->currentItem;
+    g_debug_snapshot.map_width = map->width;
+    g_debug_snapshot.map_height = map->height;
+    g_debug_snapshot.dialogue_active = dialogue_active ? 1u : 0u;
+    g_debug_snapshot.debug_button = debug_button ? 1u : 0u;
+    g_debug_snapshot.have_event = g_have_event ? 1u : 0u;
+    g_debug_snapshot.last_event_num = g_last_event_num;
+    g_debug_snapshot.last_event_step_on = g_last_event_step_on ? 1u : 0u;
+    g_debug_snapshot.buttons = buttons;
+    g_debug_snapshot.fps = fps;
+    g_debug_snapshot.actual_fps = actual_fps;
+    g_debug_snapshot.frame_us = frame_us;
+    g_debug_snapshot.uptime_us = uptime_us;
+    ++g_debug_snapshot_version;
+
+    critical_section_exit(&g_debug_snapshot_lock);
+}
+
+static void draw_debug_page_game_snapshot(const debug_display_snapshot_t *snapshot)
 {
     const st7789_font_t *debug_font = ST7789_FONT_DEFAULT_MONO;
     char line[20];
@@ -134,27 +199,27 @@ static void draw_debug_page_game(const player_t *camera,
     uint8_t x_frac;
     uint8_t y_frac;
 
-    fx_to_whole_hundredths(camera->posX, &x_whole, &x_frac);
-    fx_to_whole_hundredths(camera->posY, &y_whole, &y_frac);
+    fx_to_whole_hundredths(snapshot->camera.posX, &x_whole, &x_frac);
+    fx_to_whole_hundredths(snapshot->camera.posY, &y_whole, &y_frac);
 
     st7789_draw_debug_cell_with_font(0, 0, "GAME PAGE", debug_font, rgb565(255, 230, 80));
 
-    snprintf(line, sizeof(line), "FPS %lu", (unsigned long)fps);
+    snprintf(line, sizeof(line), "FPS %lu", (unsigned long)snapshot->fps);
     st7789_draw_debug_cell_with_font(1, 0, line, debug_font, rgb565(220, 220, 220));
 
-    snprintf(line, sizeof(line), "F %luus", (unsigned long)frame_us);
+    snprintf(line, sizeof(line), "F %luus", (unsigned long)snapshot->frame_us);
     st7789_draw_debug_cell_with_font(2, 0, line, debug_font, rgb565(220, 220, 220));
 
-    snprintf(line, sizeof(line), "BTN %02lX", (unsigned long)buttons);
+    snprintf(line, sizeof(line), "BTN %02lX", (unsigned long)snapshot->buttons);
     st7789_draw_debug_cell_with_font(0, 1, line, debug_font, rgb565(170, 240, 255));
 
-    if (g_have_event)
-        snprintf(line, sizeof(line), "EV %u%c", (unsigned)g_last_event_num, g_last_event_step_on ? '+' : '-');
+    if (snapshot->have_event)
+        snprintf(line, sizeof(line), "EV %u%c", (unsigned)snapshot->last_event_num, snapshot->last_event_step_on ? '+' : '-');
     else
         snprintf(line, sizeof(line), "EV --");
     st7789_draw_debug_cell_with_font(1, 1, line, debug_font, rgb565(170, 240, 255));
 
-    snprintf(line, sizeof(line), "D28 %u", debug_button ? 1u : 0u);
+    snprintf(line, sizeof(line), "D28 %u", (unsigned)snapshot->debug_button);
     st7789_draw_debug_cell_with_font(2, 1, line, debug_font, rgb565(255, 220, 130));
 
     snprintf(line, sizeof(line), "X %d.%02u", x_whole, x_frac);
@@ -163,25 +228,20 @@ static void draw_debug_page_game(const player_t *camera,
     snprintf(line, sizeof(line), "Y %d.%02u", y_whole, y_frac);
     st7789_draw_debug_cell_with_font(1, 2, line, debug_font, rgb565(120, 255, 120));
 
-    snprintf(line, sizeof(line), "A %d", camera->angle);
+    snprintf(line, sizeof(line), "A %d", snapshot->camera.angle);
     st7789_draw_debug_cell_with_font(2, 2, line, debug_font, rgb565(220, 190, 255));
 
-    snprintf(line, sizeof(line), "HP %u K %u", camera->health, camera->kills);
+    snprintf(line, sizeof(line), "HP %u K %u", snapshot->camera.health, snapshot->camera.kills);
     st7789_draw_debug_cell_with_font(0, 3, line, debug_font, rgb565(255, 120, 120));
 
-    snprintf(line, sizeof(line), "IT %u D %u", (unsigned)camera->currentItem, dialogue != NULL ? 1u : 0u);
+    snprintf(line, sizeof(line), "IT %u D %u", (unsigned)snapshot->camera.currentItem, (unsigned)snapshot->dialogue_active);
     st7789_draw_debug_cell_with_font(1, 3, line, debug_font, rgb565(255, 190, 120));
 
-    snprintf(line, sizeof(line), "M %ux%u", map->width, map->height);
+    snprintf(line, sizeof(line), "M %ux%u", snapshot->map_width, snapshot->map_height);
     st7789_draw_debug_cell_with_font(2, 3, line, debug_font, rgb565(200, 200, 200));
 }
 
-static void draw_debug_page_core(const player_t *camera,
-                                 const map_t *map,
-                                 bool debug_button,
-                                 uint32_t fps,
-                                 uint32_t frame_us,
-                                 uint64_t uptime_us)
+static void draw_debug_page_core_snapshot(const debug_display_snapshot_t *snapshot)
 {
     const st7789_font_t *debug_font = ST7789_FONT_DEFAULT_MONO;
     char line[20];
@@ -198,54 +258,97 @@ static void draw_debug_page_core(const player_t *camera,
     snprintf(line, sizeof(line), "SYS %luM", (unsigned long)sys_mhz);
     st7789_draw_debug_cell_with_font(0, 1, line, debug_font, rgb565(120, 255, 120));
 
-    snprintf(line, sizeof(line), "UP %lus", (unsigned long)(uptime_us / 1000000ull));
+    snprintf(line, sizeof(line), "UP %lus", (unsigned long)(snapshot->uptime_us / 1000000ull));
     st7789_draw_debug_cell_with_font(1, 1, line, debug_font, rgb565(120, 255, 120));
 
-    snprintf(line, sizeof(line), "DBG %u", debug_button ? 1u : 0u);
+    snprintf(line, sizeof(line), "DBG %u", (unsigned)snapshot->debug_button);
     st7789_draw_debug_cell_with_font(2, 1, line, debug_font, rgb565(255, 220, 130));
 
-    snprintf(line, sizeof(line), "FPS %lu", (unsigned long)fps);
+    snprintf(line, sizeof(line), "FPS %lu", (unsigned long)snapshot->fps);
     st7789_draw_debug_cell_with_font(0, 2, line, debug_font, rgb565(220, 220, 220));
 
-    snprintf(line, sizeof(line), "FR %luus", (unsigned long)frame_us);
+    snprintf(line, sizeof(line), "FR %luus", (unsigned long)snapshot->frame_us);
     st7789_draw_debug_cell_with_font(1, 2, line, debug_font, rgb565(220, 220, 220));
 
-    snprintf(line, sizeof(line), "ANG %d", camera->angle);
+    snprintf(line, sizeof(line), "ANG %d", snapshot->camera.angle);
     st7789_draw_debug_cell_with_font(2, 2, line, debug_font, rgb565(220, 190, 255));
 
-    if (g_have_event)
-        snprintf(line, sizeof(line), "EV %u%c", (unsigned)g_last_event_num, g_last_event_step_on ? '+' : '-');
+    if (snapshot->have_event)
+        snprintf(line, sizeof(line), "EV %u%c", (unsigned)snapshot->last_event_num, snapshot->last_event_step_on ? '+' : '-');
     else
         snprintf(line, sizeof(line), "EV --");
     st7789_draw_debug_cell_with_font(0, 3, line, debug_font, rgb565(255, 120, 120));
 
-    snprintf(line, sizeof(line), "MAP %ux%u", map->width, map->height);
+    snprintf(line, sizeof(line), "MAP %ux%u", snapshot->map_width, snapshot->map_height);
     st7789_draw_debug_cell_with_font(1, 3, line, debug_font, rgb565(200, 200, 200));
 
     snprintf(line, sizeof(line), "PG 2/%u", (unsigned)DEBUG_PAGE_COUNT);
     st7789_draw_debug_cell_with_font(2, 3, line, debug_font, rgb565(255, 190, 120));
 }
 
-plot_t plot_fps_big;
-int16_t plot_fps_big_storage[198];
-static const int16_t plot_fps_big_size = sizeof(plot_fps_big_storage) / sizeof(plot_fps_big_storage[0]);
-
-plot_t plot_fpsActual_big;
-int16_t plot_fpsActual_big_storage[198];
-static const int16_t plot_fpsActual_big_size = sizeof(plot_fpsActual_big_storage) / sizeof(plot_fpsActual_big_storage[0]);
-
-void draw_debug_fps(uint32_t fps, uint32_t actual_fps)
+static void draw_debug_fps_snapshot(const debug_display_snapshot_t *snapshot)
 {
-    st7789_fill_rect(0, 0, ST7789_WIDTH, ST7789_HEIGHT, rgb565(0, 0, 0));
     char line[20];
     const st7789_font_t *debug_font = ST7789_FONT_DEFAULT_MONO;
 
-    snprintf(line, sizeof(line), "FPS %lu", (unsigned long)fps);
+    st7789_fill_rect(0, 0, ST7789_WIDTH, ST7789_HEIGHT, rgb565(0, 0, 0));
+    snprintf(line, sizeof(line), "FPS %lu", (unsigned long)snapshot->fps);
     st7789_draw_text(3, 3, 300, line, debug_font, rgb565(255, 255, 255));
-    snprintf(line, sizeof(line), "ACT %lu", (unsigned long)actual_fps);
+    snprintf(line, sizeof(line), "ACT %lu", (unsigned long)snapshot->actual_fps);
     st7789_draw_text(3, 14, 300, line, debug_font, rgb565(255, 255, 255));
-    plot_draw(&plot_fps_big, true);
-    plot_draw(&plot_fpsActual_big, false);
+}
+
+static void core1_debug_display_main(void)
+{
+    uint32_t last_seen_version = 0;
+    debug_display_snapshot_t snapshot;
+    plot_t fps_plot;
+    plot_t actual_fps_plot;
+    int16_t fps_history[198];
+    int16_t actual_fps_history[198];
+
+    plot_init(&fps_plot, 60, 5, 200, 70, 1, 0, 5000, rgb565(0, 0, 0), rgb565(255, 255, 0), fps_history, (uint16_t)(sizeof(fps_history) / sizeof(fps_history[0])));
+    plot_init(&actual_fps_plot, 60, 5, 200, 70, 1, 0, 200, rgb565(0, 0, 0), rgb565(255, 0, 0), actual_fps_history, (uint16_t)(sizeof(actual_fps_history) / sizeof(actual_fps_history[0])));
+
+    while (true)
+    {
+        uint32_t version;
+
+        critical_section_enter_blocking(&g_debug_snapshot_lock);
+        version = g_debug_snapshot_version;
+        if (version != last_seen_version)
+            snapshot = g_debug_snapshot;
+        critical_section_exit(&g_debug_snapshot_lock);
+
+        if (version == last_seen_version)
+        {
+            tight_loop_contents();
+            continue;
+        }
+
+        last_seen_version = version;
+        plot_add(&fps_plot, (int16_t)snapshot.fps);
+        plot_add(&actual_fps_plot, (int16_t)snapshot.actual_fps);
+
+        switch (snapshot.page)
+        {
+            case DEBUG_PAGE_GAME:
+                draw_debug_page_game_snapshot(&snapshot);
+                break;
+            case DEBUG_PAGE_CORE:
+                draw_debug_page_core_snapshot(&snapshot);
+                break;
+            case DEBUG_PAGE_FPS:
+                draw_debug_fps_snapshot(&snapshot);
+                plot_draw(&fps_plot, true);
+                plot_draw(&actual_fps_plot, false);
+                break;
+            default:
+                break;
+        }
+
+        st7789_present_full();
+    }
 }
 
 static void on_map_event(uint8_t param1, uint8_t param2)
@@ -259,6 +362,7 @@ int main(void)
 {
     stdio_init_all();
     io_init();
+    critical_section_init(&g_debug_snapshot_lock);
 
     st7789_init();
     st7789_fill_rect(0, 0, ST7789_WIDTH, ST7789_HEIGHT, rgb565(8, 8, 8));
@@ -287,9 +391,8 @@ int main(void)
 
     bool prev_use = false;
     bool prev_debug_button = false;
-
-    plot_init(&plot_fps_big, 60, 5, 200, 70, 1, 0, 5000, rgb565(0, 0, 0), rgb565(255, 255, 0), plot_fps_big_storage, plot_fps_big_size);
-    plot_init(&plot_fpsActual_big, 60, 5, 200, 70, 1, 0, 100, rgb565(0, 0, 0), rgb565(255, 0, 0), plot_fpsActual_big_storage, plot_fpsActual_big_size);
+    publish_debug_snapshot(debug_page, &camera, current_map, false, 0, false, 0, 0, 0, to_us_since_boot(get_absolute_time()));
+    multicore_launch_core1(core1_debug_display_main);
 
     while (true)
     {
@@ -337,8 +440,6 @@ int main(void)
             frame_len_actual_us = 1;
         uint32_t fps = (1000000u + (frame_len_us / 2u)) / frame_len_us;
         uint32_t actual_fps = (1000000u + (frame_len_actual_us / 2u)) / frame_len_actual_us;
-        plot_add(&plot_fps_big, (int16_t)fps);
-        plot_add(&plot_fpsActual_big, (int16_t)actual_fps);
 
         millis = to_ms_since_boot(frame_end);
 
@@ -350,23 +451,18 @@ int main(void)
         }
         prev_debug_button = debug_button;
 
-        switch(debug_page)
-        {
-            case DEBUG_PAGE_GAME:
-                draw_debug_page_game(&camera, current_map, current_dialogue, button_mask, debug_button, fps, frame_len_us);
-                break;
-            case DEBUG_PAGE_CORE:
-                draw_debug_page_core(&camera, current_map, debug_button, fps, frame_len_us, to_us_since_boot(get_absolute_time()));
-                break;
-            case DEBUG_PAGE_FPS:
-                draw_debug_fps(fps, actual_fps);
-                break;
-            default:
-                break;
-        }
+        publish_debug_snapshot(debug_page,
+                               &camera,
+                               current_map,
+                               dialogue_active,
+                               button_mask,
+                               debug_button,
+                               fps,
+                               actual_fps,
+                               frame_len_us,
+                               to_us_since_boot(get_absolute_time()));
 
         dogm128_refresh();
-        st7789_present_full();
 
         // sleep_ms(1);
     }

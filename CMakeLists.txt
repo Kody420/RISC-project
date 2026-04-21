@@ -69,6 +69,7 @@ target_include_directories(RISC-project PRIVATE
 target_link_libraries(RISC-project 
         hardware_spi
     hardware_i2c
+    pico_multicore
         )
 
 pico_add_extra_outputs(RISC-project)
