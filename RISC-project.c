@@ -304,6 +304,8 @@ static void draw_debug_fps_snapshot(const debug_display_snapshot_t *snapshot)
 
 static void core1_debug_display_main(void)
 {
+    multicore_lockout_victim_init();
+
     uint32_t last_seen_version = 0;
     debug_display_snapshot_t snapshot;
     plot_t fps_plot;
@@ -470,6 +472,12 @@ entities[0].posX = FX(5);
     publish_debug_snapshot(debug_page, &camera, current_map, false, 0, false, 0, 0, 0, to_us_since_boot(get_absolute_time()), MovementRecorder_GetStatus());
     multicore_launch_core1(core1_debug_display_main);
 
+    if (MovementRecorder_IsEmpty())
+    {
+        MovementRecorder_StartRecording();
+    }
+    else MovementRecorder_StartReplay();
+
     while (true)
     {
         static absolute_time_t last_frame_complete = {0};
@@ -477,9 +485,7 @@ entities[0].posX = FX(5);
         uint64_t frame_start_us = to_us_since_boot(frame_start);
         millis = to_ms_since_boot(frame_start);
 
-        uint32_t button_mask = read_buttons_mask();
-
-        buttons_t buttons = buttons_from_mask(button_mask);
+        buttons_t buttons = buttons_from_mask(read_buttons_mask());
         MovementRecorder_CurrentValues(buttons);
         if (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_REPLAYING)
             buttons = MovementRecorder_GetPlaybackValues();
@@ -530,7 +536,7 @@ entities[0].posX = FX(5);
         // Toggle debug page on GP28 rising edge and also do button recording
         bool debug_button = read_debug_button();
         static millis_t last_debug_button_press_ms = 0;
-        if (debug_button && !prev_debug_button)
+        if (debug_button != prev_debug_button)
             last_debug_button_press_ms = millis;
         if (!debug_button && prev_debug_button && (millis - last_debug_button_press_ms < 500))
         {
@@ -542,10 +548,10 @@ entities[0].posX = FX(5);
             switch(MovementRecorder_GetStatus())
             {
                 case MOVEMENT_RECORDER_STATUS_IDLE:
-                    MovementRecorder_Init();
                     MovementRecorder_StartRecording();
                     break;
                 case MOVEMENT_RECORDER_STATUS_RECORDING:
+                    MovementRecorder_StopRecording();
                     MovementRecorder_StartReplay();
                     break;
                 case MOVEMENT_RECORDER_STATUS_REPLAYING:
@@ -560,7 +566,7 @@ entities[0].posX = FX(5);
                                &camera,
                                current_map,
                                dialogue_active,
-                               button_mask,
+                               buttons.all,
                                debug_button,
                                fps,
                                actual_fps,

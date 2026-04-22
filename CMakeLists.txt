@@ -68,7 +68,9 @@ target_include_directories(RISC-project PRIVATE
 
 # Add any user requested libraries
 target_link_libraries(RISC-project 
-        hardware_spi
+    hardware_flash
+    hardware_spi
+    hardware_sync
     hardware_i2c
     pico_multicore
         )
