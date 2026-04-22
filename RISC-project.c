@@ -9,6 +9,7 @@
 #include "pico/stdlib.h"
 
 #include "st7789.h"
+#include "MovementRecorder.h"
 
 #include "NEN-project/assets.h"
 #include "NEN-project/HUDStuff.h"
@@ -147,6 +148,7 @@ typedef struct
     uint32_t actual_fps;
     uint32_t frame_us;
     uint64_t uptime_us;
+    movement_recorder_status_t movement_recorder_status;
 } debug_display_snapshot_t;
 
 static critical_section_t g_debug_snapshot_lock;
@@ -162,7 +164,8 @@ static void publish_debug_snapshot(debug_page_t page,
                                    uint32_t fps,
                                    uint32_t actual_fps,
                                    uint32_t frame_us,
-                                   uint64_t uptime_us)
+                                   uint64_t uptime_us,
+                                   movement_recorder_status_t movement_recorder_status)
 {
     critical_section_enter_blocking(&g_debug_snapshot_lock);
 
@@ -185,6 +188,7 @@ static void publish_debug_snapshot(debug_page_t page,
     g_debug_snapshot.actual_fps = actual_fps;
     g_debug_snapshot.frame_us = frame_us;
     g_debug_snapshot.uptime_us = uptime_us;
+    g_debug_snapshot.movement_recorder_status = movement_recorder_status;
     ++g_debug_snapshot_version;
 
     critical_section_exit(&g_debug_snapshot_lock);
@@ -330,6 +334,8 @@ static void core1_debug_display_main(void)
         plot_add(&fps_plot, (int16_t)snapshot.fps);
         plot_add(&actual_fps_plot, (int16_t)snapshot.actual_fps);
 
+        st7789_fill_rect(0, 0, ST7789_WIDTH, ST7789_HEIGHT, rgb565(0, 0, 0));
+
         switch (snapshot.page)
         {
             case DEBUG_PAGE_GAME:
@@ -345,6 +351,21 @@ static void core1_debug_display_main(void)
                 break;
             default:
                 break;
+        }
+
+        switch (snapshot.movement_recorder_status)
+        {
+        case MOVEMENT_RECORDER_STATUS_IDLE:
+            st7789_fill_rect(ST7789_WIDTH - 20, ST7789_HEIGHT - 20, ST7789_WIDTH, ST7789_HEIGHT, rgb565(10, 10, 10));
+            break;
+        case MOVEMENT_RECORDER_STATUS_RECORDING:
+            st7789_fill_rect(ST7789_WIDTH - 20, ST7789_HEIGHT - 20, ST7789_WIDTH, ST7789_HEIGHT, rgb565(255, 0, 0));
+            break;
+        case MOVEMENT_RECORDER_STATUS_REPLAYING:
+            st7789_fill_rect(ST7789_WIDTH - 20, ST7789_HEIGHT - 20, ST7789_WIDTH, ST7789_HEIGHT, rgb565(0, 255, 0));
+            break;
+        default:
+            break;
         }
 
         st7789_present_full();
@@ -370,6 +391,8 @@ int main(void)
 
     dogm128_init();
     dogm128_contrast(0x8F);
+
+    MovementRecorder_Init();
 
     map_t *current_map = &WallDemoMap;
     const dialogue_t *current_dialogue = NULL;
@@ -444,7 +467,7 @@ entities[0].posX = FX(5);
 
     bool prev_use = false;
     bool prev_debug_button = false;
-    publish_debug_snapshot(debug_page, &camera, current_map, false, 0, false, 0, 0, 0, to_us_since_boot(get_absolute_time()));
+    publish_debug_snapshot(debug_page, &camera, current_map, false, 0, false, 0, 0, 0, to_us_since_boot(get_absolute_time()), MovementRecorder_GetStatus());
     multicore_launch_core1(core1_debug_display_main);
 
     while (true)
@@ -457,6 +480,9 @@ entities[0].posX = FX(5);
         uint32_t button_mask = read_buttons_mask();
 
         buttons_t buttons = buttons_from_mask(button_mask);
+        MovementRecorder_CurrentValues(buttons);
+        if (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_REPLAYING)
+            buttons = MovementRecorder_GetPlaybackValues();
 
         MoveCamera(&camera, current_map, buttons, &current_dialogue);
 
@@ -498,11 +524,35 @@ entities[0].posX = FX(5);
 
         millis = to_ms_since_boot(frame_end);
 
-        // Toggle debug page on GP28 rising edge
+
+
+
+        // Toggle debug page on GP28 rising edge and also do button recording
         bool debug_button = read_debug_button();
+        static millis_t last_debug_button_press_ms = 0;
         if (debug_button && !prev_debug_button)
+            last_debug_button_press_ms = millis;
+        if (!debug_button && prev_debug_button && (millis - last_debug_button_press_ms < 500))
         {
             pageCycle();
+            last_debug_button_press_ms = millis;
+        }
+        if (millis - last_debug_button_press_ms >= 500 && debug_button)
+        {
+            switch(MovementRecorder_GetStatus())
+            {
+                case MOVEMENT_RECORDER_STATUS_IDLE:
+                    MovementRecorder_Init();
+                    MovementRecorder_StartRecording();
+                    break;
+                case MOVEMENT_RECORDER_STATUS_RECORDING:
+                    MovementRecorder_StartReplay();
+                    break;
+                case MOVEMENT_RECORDER_STATUS_REPLAYING:
+                    MovementRecorder_StopReplay();
+                    break;
+            }
+            last_debug_button_press_ms = millis;
         }
         prev_debug_button = debug_button;
 
@@ -515,7 +565,8 @@ entities[0].posX = FX(5);
                                fps,
                                actual_fps,
                                frame_len_us,
-                               to_us_since_boot(get_absolute_time()));
+                               to_us_since_boot(get_absolute_time()),
+                               MovementRecorder_GetStatus());
 
         dogm128_refresh();
 
