@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "hardware/clocks.h"
+#include "hardware/watchdog.h"
 #include "pico/critical_section.h"
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
@@ -23,20 +24,33 @@ volatile millis_t millis = 0;
 static const uint8_t BUTTON_PINS[IO_COUNT] = {15, 13, 9, 5, 3};
 static const uint8_t LED_PINS[IO_COUNT] = {14, 12, 8, 4, 2};
 #define DEBUG_BUTTON_PIN 28
+#define OLED_PRESENT_INTERVAL_US (1000000u / 60u)
+#define GAME_UPDATE_INTERVAL_US (1000000u / 173u)
+#define BENCH_MAX_VALID_FRAME_US 50000u
+#define BENCH_FPS_GRAPH_MAX 6000
 
 static uint8_t g_last_event_num = 0;
 static bool g_last_event_step_on = false;
 static bool g_have_event = false;
 
+static player_t camera;
+static entity_t entities[MAX_ENTITIES];
+static map_t *current_map = &Level0Map;
+static const dialogue_t *current_dialogue = NULL;
+static millis_t use_press_ms = 0;
+static bool show_fps = false;
+static uint8_t current_level_num = 0;
+
 typedef enum
 {
-    DEBUG_PAGE_GAME = 0,
-    DEBUG_PAGE_CORE = 1,
-    DEBUG_PAGE_FPS = 2,
+    DEBUG_PAGE_STATUS = 0,
+    DEBUG_PAGE_FPS = 1,
+    DEBUG_PAGE_BENCH_GRAPH = 2,
+    DEBUG_PAGE_BENCH_SUMMARY = 3,
     DEBUG_PAGE_COUNT,
 } debug_page_t;
 
-static debug_page_t debug_page = DEBUG_PAGE_GAME;
+static debug_page_t debug_page = DEBUG_PAGE_STATUS;
 static void pageCycle()
 {
     debug_page = (debug_page_t)((debug_page + 1) % DEBUG_PAGE_COUNT);
@@ -134,6 +148,23 @@ typedef struct
 
 typedef struct
 {
+    uint8_t active;
+    uint8_t complete;
+    uint32_t run_id;
+    uint32_t progress_permille;
+    uint32_t recorded_samples;
+    uint32_t frames;
+    uint32_t elapsed_ms;
+    uint32_t avg_fps;
+    uint32_t avg_frame_us;
+    uint32_t min_frame_us;
+    uint32_t max_frame_us;
+    uint32_t frames_over_16ms;
+    uint32_t frames_over_33ms;
+} benchmark_snapshot_t;
+
+typedef struct
+{
     debug_page_t page;
     debug_camera_snapshot_t camera;
     uint8_t map_width;
@@ -149,6 +180,7 @@ typedef struct
     uint32_t frame_us;
     uint64_t uptime_us;
     movement_recorder_status_t movement_recorder_status;
+    benchmark_snapshot_t benchmark;
 } debug_display_snapshot_t;
 
 static critical_section_t g_debug_snapshot_lock;
@@ -165,7 +197,8 @@ static void publish_debug_snapshot(debug_page_t page,
                                    uint32_t actual_fps,
                                    uint32_t frame_us,
                                    uint64_t uptime_us,
-                                   movement_recorder_status_t movement_recorder_status)
+                                   movement_recorder_status_t movement_recorder_status,
+                                   const benchmark_snapshot_t *benchmark)
 {
     critical_section_enter_blocking(&g_debug_snapshot_lock);
 
@@ -189,12 +222,16 @@ static void publish_debug_snapshot(debug_page_t page,
     g_debug_snapshot.frame_us = frame_us;
     g_debug_snapshot.uptime_us = uptime_us;
     g_debug_snapshot.movement_recorder_status = movement_recorder_status;
+    if (benchmark)
+        g_debug_snapshot.benchmark = *benchmark;
+    else
+        memset(&g_debug_snapshot.benchmark, 0, sizeof(g_debug_snapshot.benchmark));
     ++g_debug_snapshot_version;
 
     critical_section_exit(&g_debug_snapshot_lock);
 }
 
-static void draw_debug_page_game_snapshot(const debug_display_snapshot_t *snapshot)
+static void draw_debug_status_snapshot(const debug_display_snapshot_t *snapshot)
 {
     const st7789_font_t *debug_font = ST7789_FONT_DEFAULT_MONO;
     char line[20];
@@ -206,7 +243,8 @@ static void draw_debug_page_game_snapshot(const debug_display_snapshot_t *snapsh
     fx_to_whole_hundredths(snapshot->camera.posX, &x_whole, &x_frac);
     fx_to_whole_hundredths(snapshot->camera.posY, &y_whole, &y_frac);
 
-    st7789_draw_debug_cell_with_font(0, 0, "GAME PAGE", debug_font, rgb565(255, 230, 80));
+    snprintf(line, sizeof(line), "%s %luM", build_arch_name(), (unsigned long)(clock_get_hz(clk_sys) / 1000000u));
+    st7789_draw_debug_cell_with_font(0, 0, line, debug_font, rgb565(255, 230, 80));
 
     snprintf(line, sizeof(line), "FPS %lu", (unsigned long)snapshot->fps);
     st7789_draw_debug_cell_with_font(1, 0, line, debug_font, rgb565(220, 220, 220));
@@ -217,13 +255,10 @@ static void draw_debug_page_game_snapshot(const debug_display_snapshot_t *snapsh
     snprintf(line, sizeof(line), "BTN %02lX", (unsigned long)snapshot->buttons);
     st7789_draw_debug_cell_with_font(0, 1, line, debug_font, rgb565(170, 240, 255));
 
-    if (snapshot->have_event)
-        snprintf(line, sizeof(line), "EV %u%c", (unsigned)snapshot->last_event_num, snapshot->last_event_step_on ? '+' : '-');
-    else
-        snprintf(line, sizeof(line), "EV --");
+    snprintf(line, sizeof(line), "REC %u", (unsigned)snapshot->movement_recorder_status);
     st7789_draw_debug_cell_with_font(1, 1, line, debug_font, rgb565(170, 240, 255));
 
-    snprintf(line, sizeof(line), "D28 %u", (unsigned)snapshot->debug_button);
+    snprintf(line, sizeof(line), "D28 %u PG 1", (unsigned)snapshot->debug_button);
     st7789_draw_debug_cell_with_font(2, 1, line, debug_font, rgb565(255, 220, 130));
 
     snprintf(line, sizeof(line), "X %d.%02u", x_whole, x_frac);
@@ -238,56 +273,16 @@ static void draw_debug_page_game_snapshot(const debug_display_snapshot_t *snapsh
     snprintf(line, sizeof(line), "HP %u K %u", snapshot->camera.health, snapshot->camera.kills);
     st7789_draw_debug_cell_with_font(0, 3, line, debug_font, rgb565(255, 120, 120));
 
-    snprintf(line, sizeof(line), "IT %u D %u", (unsigned)snapshot->camera.currentItem, (unsigned)snapshot->dialogue_active);
-    st7789_draw_debug_cell_with_font(1, 3, line, debug_font, rgb565(255, 190, 120));
-
-    snprintf(line, sizeof(line), "M %ux%u", snapshot->map_width, snapshot->map_height);
-    st7789_draw_debug_cell_with_font(2, 3, line, debug_font, rgb565(200, 200, 200));
-}
-
-static void draw_debug_page_core_snapshot(const debug_display_snapshot_t *snapshot)
-{
-    const st7789_font_t *debug_font = ST7789_FONT_DEFAULT_MONO;
-    char line[20];
-    uint32_t sys_mhz = clock_get_hz(clk_sys) / 1000000u;
-
-    st7789_draw_debug_cell_with_font(0, 0, "CORE PAGE", debug_font, rgb565(255, 230, 80));
-
-    snprintf(line, sizeof(line), "ARCH %s", build_arch_name());
-    st7789_draw_debug_cell_with_font(1, 0, line, debug_font, rgb565(170, 240, 255));
-
-    snprintf(line, sizeof(line), "CNUM %u", get_core_num());
-    st7789_draw_debug_cell_with_font(2, 0, line, debug_font, rgb565(170, 240, 255));
-
-    snprintf(line, sizeof(line), "SYS %luM", (unsigned long)sys_mhz);
-    st7789_draw_debug_cell_with_font(0, 1, line, debug_font, rgb565(120, 255, 120));
-
-    snprintf(line, sizeof(line), "UP %lus", (unsigned long)(snapshot->uptime_us / 1000000ull));
-    st7789_draw_debug_cell_with_font(1, 1, line, debug_font, rgb565(120, 255, 120));
-
-    snprintf(line, sizeof(line), "DBG %u", (unsigned)snapshot->debug_button);
-    st7789_draw_debug_cell_with_font(2, 1, line, debug_font, rgb565(255, 220, 130));
-
-    snprintf(line, sizeof(line), "FPS %lu", (unsigned long)snapshot->fps);
-    st7789_draw_debug_cell_with_font(0, 2, line, debug_font, rgb565(220, 220, 220));
-
-    snprintf(line, sizeof(line), "FR %luus", (unsigned long)snapshot->frame_us);
-    st7789_draw_debug_cell_with_font(1, 2, line, debug_font, rgb565(220, 220, 220));
-
-    snprintf(line, sizeof(line), "ANG %d", snapshot->camera.angle);
-    st7789_draw_debug_cell_with_font(2, 2, line, debug_font, rgb565(220, 190, 255));
-
-    if (snapshot->have_event)
+    if (snapshot->benchmark.active)
+        snprintf(line, sizeof(line), "B %lu%% %luF", (unsigned long)(snapshot->benchmark.progress_permille / 10u), (unsigned long)snapshot->benchmark.frames);
+    else if (snapshot->have_event)
         snprintf(line, sizeof(line), "EV %u%c", (unsigned)snapshot->last_event_num, snapshot->last_event_step_on ? '+' : '-');
     else
         snprintf(line, sizeof(line), "EV --");
-    st7789_draw_debug_cell_with_font(0, 3, line, debug_font, rgb565(255, 120, 120));
+    st7789_draw_debug_cell_with_font(1, 3, line, debug_font, rgb565(255, 190, 120));
 
-    snprintf(line, sizeof(line), "MAP %ux%u", snapshot->map_width, snapshot->map_height);
-    st7789_draw_debug_cell_with_font(1, 3, line, debug_font, rgb565(200, 200, 200));
-
-    snprintf(line, sizeof(line), "PG 2/%u", (unsigned)DEBUG_PAGE_COUNT);
-    st7789_draw_debug_cell_with_font(2, 3, line, debug_font, rgb565(255, 190, 120));
+    snprintf(line, sizeof(line), "M %ux%u I%u", snapshot->map_width, snapshot->map_height, (unsigned)snapshot->camera.currentItem);
+    st7789_draw_debug_cell_with_font(2, 3, line, debug_font, rgb565(200, 200, 200));
 }
 
 static void draw_debug_fps_snapshot(const debug_display_snapshot_t *snapshot)
@@ -302,19 +297,128 @@ static void draw_debug_fps_snapshot(const debug_display_snapshot_t *snapshot)
     st7789_draw_text(3, 14, 300, line, debug_font, rgb565(255, 255, 255));
 }
 
+static void draw_debug_benchmark_summary(const debug_display_snapshot_t *snapshot)
+{
+    const st7789_font_t *debug_font = ST7789_FONT_DEFAULT_MONO;
+    const benchmark_snapshot_t *b = &snapshot->benchmark;
+    char line[20];
+
+    snprintf(line, sizeof(line), "BENCH %s", b->active ? "RUN" : (b->complete ? "DONE" : "WAIT"));
+    st7789_draw_debug_cell_with_font(0, 0, line, debug_font, rgb565(255, 230, 80));
+
+    snprintf(line, sizeof(line), "FRAMES %lu", (unsigned long)b->frames);
+    st7789_draw_debug_cell_with_font(1, 0, line, debug_font, rgb565(220, 220, 220));
+
+    snprintf(line, sizeof(line), "TIME %lums", (unsigned long)b->elapsed_ms);
+    st7789_draw_debug_cell_with_font(2, 0, line, debug_font, rgb565(220, 220, 220));
+
+    snprintf(line, sizeof(line), "AVG %luFPS", (unsigned long)b->avg_fps);
+    st7789_draw_debug_cell_with_font(0, 1, line, debug_font, rgb565(255, 255, 0));
+
+    snprintf(line, sizeof(line), "AUS %lu", (unsigned long)b->avg_frame_us);
+    st7789_draw_debug_cell_with_font(1, 1, line, debug_font, rgb565(170, 240, 255));
+
+    snprintf(line, sizeof(line), "SAMP %lu", (unsigned long)b->recorded_samples);
+    st7789_draw_debug_cell_with_font(2, 1, line, debug_font, rgb565(170, 240, 255));
+
+    snprintf(line, sizeof(line), "MIN %lu", (unsigned long)b->min_frame_us);
+    st7789_draw_debug_cell_with_font(0, 2, line, debug_font, rgb565(120, 255, 120));
+
+    snprintf(line, sizeof(line), "MAX %lu", (unsigned long)b->max_frame_us);
+    st7789_draw_debug_cell_with_font(1, 2, line, debug_font, rgb565(255, 120, 120));
+
+    snprintf(line, sizeof(line), "PROG %lu%%", (unsigned long)(b->progress_permille / 10u));
+    st7789_draw_debug_cell_with_font(2, 2, line, debug_font, rgb565(220, 190, 255));
+
+    snprintf(line, sizeof(line), ">16 %lu", (unsigned long)b->frames_over_16ms);
+    st7789_draw_debug_cell_with_font(0, 3, line, debug_font, rgb565(255, 190, 120));
+
+    snprintf(line, sizeof(line), ">33 %lu", (unsigned long)b->frames_over_33ms);
+    st7789_draw_debug_cell_with_font(1, 3, line, debug_font, rgb565(255, 190, 120));
+
+    snprintf(line, sizeof(line), "RUN %lu", (unsigned long)b->run_id);
+    st7789_draw_debug_cell_with_font(2, 3, line, debug_font, rgb565(200, 200, 200));
+}
+
+#define BENCH_GRAPH_POINTS 280u
+
+static void bench_graph_clear(plot_t *plot, int16_t history[BENCH_GRAPH_POINTS], uint32_t sums[BENCH_GRAPH_POINTS], uint16_t counts[BENCH_GRAPH_POINTS])
+{
+    plot_clear(plot);
+    plot->count = BENCH_GRAPH_POINTS;
+    for (uint16_t i = 0; i < BENCH_GRAPH_POINTS; ++i)
+    {
+        history[i] = 0;
+        sums[i] = 0;
+        counts[i] = 0;
+    }
+}
+
+static void bench_graph_add_sample(plot_t *plot,
+                                   int16_t history[BENCH_GRAPH_POINTS],
+                                   uint32_t sums[BENCH_GRAPH_POINTS],
+                                   uint16_t counts[BENCH_GRAPH_POINTS],
+                                   uint32_t progress_permille,
+                                   uint32_t fps)
+{
+    uint32_t index;
+
+    if (progress_permille > 1000u)
+        progress_permille = 1000u;
+    if (fps > BENCH_FPS_GRAPH_MAX)
+        fps = BENCH_FPS_GRAPH_MAX;
+
+    index = (progress_permille * (BENCH_GRAPH_POINTS - 1u)) / 1000u;
+    sums[index] += fps;
+    if (counts[index] != UINT16_MAX)
+        counts[index]++;
+
+    if (counts[index] != 0)
+        history[index] = (int16_t)(sums[index] / counts[index]);
+
+    plot->count = BENCH_GRAPH_POINTS;
+}
+
+static void draw_debug_benchmark_graph(const debug_display_snapshot_t *snapshot, plot_t *bench_plot)
+{
+    const st7789_font_t *debug_font = ST7789_FONT_DEFAULT_MONO;
+    char line[24];
+
+    st7789_fill_rect(0, 0, ST7789_WIDTH, ST7789_HEIGHT, rgb565(0, 0, 0));
+    snprintf(line, sizeof(line), "RUN %lu %lu%%",
+             (unsigned long)snapshot->benchmark.run_id,
+             (unsigned long)(snapshot->benchmark.progress_permille / 10u));
+    st7789_draw_text(3, 3, ST7789_WIDTH - 2, line, debug_font, rgb565(255, 255, 255));
+
+    snprintf(line, sizeof(line), "%luF AVG %lu",
+             (unsigned long)snapshot->benchmark.frames,
+             (unsigned long)snapshot->benchmark.avg_fps);
+    st7789_draw_text(3, 14, ST7789_WIDTH - 2, line, debug_font, rgb565(255, 255, 0));
+
+    plot_draw(bench_plot, true);
+}
+
 static void core1_debug_display_main(void)
 {
     multicore_lockout_victim_init();
+    MovementRecorder_Core1LockoutReady();
 
     uint32_t last_seen_version = 0;
     debug_display_snapshot_t snapshot;
     plot_t fps_plot;
     plot_t actual_fps_plot;
+    plot_t bench_plot;
     int16_t fps_history[198];
     int16_t actual_fps_history[198];
+    static int16_t bench_history[BENCH_GRAPH_POINTS];
+    static uint32_t bench_sums[BENCH_GRAPH_POINTS];
+    static uint16_t bench_counts[BENCH_GRAPH_POINTS];
+    uint32_t bench_graph_run_id = 0;
 
-    plot_init(&fps_plot, 60, 5, 200, 70, 1, 0, 5000, rgb565(0, 0, 0), rgb565(255, 255, 0), fps_history, (uint16_t)(sizeof(fps_history) / sizeof(fps_history[0])));
+    plot_init(&fps_plot, 60, 5, 200, 70, 1, 0, BENCH_FPS_GRAPH_MAX, rgb565(0, 0, 0), rgb565(255, 255, 0), fps_history, (uint16_t)(sizeof(fps_history) / sizeof(fps_history[0])));
     plot_init(&actual_fps_plot, 60, 5, 200, 70, 1, 0, 200, rgb565(0, 0, 0), rgb565(255, 0, 0), actual_fps_history, (uint16_t)(sizeof(actual_fps_history) / sizeof(actual_fps_history[0])));
+    plot_init(&bench_plot, 1, 25, 282, 50, 1, 0, BENCH_FPS_GRAPH_MAX, rgb565(0, 0, 0), rgb565(255, 255, 0), bench_history, BENCH_GRAPH_POINTS);
+    bench_graph_clear(&bench_plot, bench_history, bench_sums, bench_counts);
 
     while (true)
     {
@@ -333,26 +437,49 @@ static void core1_debug_display_main(void)
         }
 
         last_seen_version = version;
-        plot_add(&fps_plot, (int16_t)snapshot.fps);
+        uint32_t graph_fps = snapshot.fps > BENCH_FPS_GRAPH_MAX ? BENCH_FPS_GRAPH_MAX : snapshot.fps;
+        plot_add(&fps_plot, (int16_t)graph_fps);
         plot_add(&actual_fps_plot, (int16_t)snapshot.actual_fps);
+
+        if (snapshot.benchmark.run_id != bench_graph_run_id)
+        {
+            bench_graph_run_id = snapshot.benchmark.run_id;
+            bench_graph_clear(&bench_plot, bench_history, bench_sums, bench_counts);
+        }
+
+        if (snapshot.benchmark.active)
+        {
+            if (snapshot.frame_us <= BENCH_MAX_VALID_FRAME_US)
+            {
+                bench_graph_add_sample(&bench_plot,
+                                       bench_history,
+                                       bench_sums,
+                                       bench_counts,
+                                       snapshot.benchmark.progress_permille,
+                                       graph_fps);
+            }
+        }
 
         st7789_fill_rect(0, 0, ST7789_WIDTH, ST7789_HEIGHT, rgb565(0, 0, 0));
 
         switch (snapshot.page)
         {
-            case DEBUG_PAGE_GAME:
-                draw_debug_page_game_snapshot(&snapshot);
-                break;
-            case DEBUG_PAGE_CORE:
-                draw_debug_page_core_snapshot(&snapshot);
-                break;
-            case DEBUG_PAGE_FPS:
-                draw_debug_fps_snapshot(&snapshot);
-                plot_draw(&fps_plot, true);
-                plot_draw(&actual_fps_plot, false);
-                break;
-            default:
-                break;
+        case DEBUG_PAGE_STATUS:
+            draw_debug_status_snapshot(&snapshot);
+            break;
+        case DEBUG_PAGE_FPS:
+            draw_debug_fps_snapshot(&snapshot);
+            plot_draw(&fps_plot, true);
+            plot_draw(&actual_fps_plot, false);
+            break;
+        case DEBUG_PAGE_BENCH_GRAPH:
+            draw_debug_benchmark_graph(&snapshot, &bench_plot);
+            break;
+        case DEBUG_PAGE_BENCH_SUMMARY:
+            draw_debug_benchmark_summary(&snapshot);
+            break;
+        default:
+            break;
         }
 
         switch (snapshot.movement_recorder_status)
@@ -374,11 +501,255 @@ static void core1_debug_display_main(void)
     }
 }
 
+static void change_level(uint8_t level)
+{
+    switch (level)
+    {
+    case 0:
+        current_map = &Level0Map;
+        break;
+    case 1:
+        current_map = &Level1Map;
+        break;
+    case 2:
+        current_map = &Level2Map;
+        for (uint8_t i = 0; i < MAX_ENTITIES; i++)
+        {
+            uint8_t type = rand16();
+            while (type > 2)
+                type = rand16();
+            memcpy(&entities[i], enemieTemplates[type], sizeof(entity_t));
+            RespawnEntity(current_map, &entities[i]);
+        }
+        break;
+    case 3:
+        current_map = &Level3Map;
+        for (uint8_t i = 0; i < MAX_ENTITIES; i++)
+        {
+            memcpy(&entities[i], &soilderTemplate, sizeof(entity_t));
+            RespawnEntity(current_map, &entities[i]);
+        }
+        break;
+    default:
+        return;
+    }
+
+    camera.posX = FX(current_map->DefaultSpwanPoint[0]);
+    camera.posY = FX(current_map->DefaultSpwanPoint[1]);
+    current_dialogue = NULL;
+    current_level_num = level;
+}
+
+static void flash_screen(void)
+{
+    for (uint8_t i = 0; i < 16; i++)
+    {
+        dogm128_invert();
+        dogm128_refresh();
+        sleep_ms(80);
+    }
+}
+
+uint8_t menuOpen = 0;
+
+static void DrawMenu(buttons_t state, bool disallow_resume)
+{
+    if (menuOpen == 0)
+    {
+        if (state.all >= 0b11111)
+            menuOpen = 1;
+        else
+            return;
+    }
+    if (menuOpen == 1)
+    {
+        if (state.all == 0)
+            menuOpen = 2;
+    }
+
+    dogm128_fill_rect(0, 64 - 7, 128, 7, DISP_COL_WHITE);
+    dogm128_hline(0, 64 - 7, 128, DISP_COL_BLACK);
+    dogm128_text(1, 64 - 5, "resume");
+    dogm128_text(30, 64 - 5, "fps");
+    if (show_fps)
+    {
+        dogm128_text(64 - 10, 64 - 5, "level");
+        dogm128_text(90 - 8, 64 - 5, "item");
+    }
+    else
+    {
+        dogm128_text(64 - 18, 64 - 5, "clear rec");
+    }
+    dogm128_text(127 - 20, 64 - 5, "reset");
+
+    if (menuOpen == 2)
+    {
+        if (state.back && !disallow_resume)
+            menuOpen = 0;
+        if (state.front)
+        {
+            show_fps = !show_fps;
+            menuOpen = 0;
+        }
+        if (state.use)
+        {
+            if (show_fps)
+            {
+                current_level_num++;
+                if (current_level_num > 3)
+                    current_level_num = 0;
+                change_level(current_level_num);
+            }
+            else
+            {
+                MovementRecorder_Clear();
+            }
+            menuOpen = 0;
+        }
+        if (show_fps && state.left)
+        {
+            camera.currentItem++;
+            if (camera.currentItem >= ITEM_COUNT)
+                camera.currentItem = ITEM_HAND;
+            menuOpen = 0;
+        }
+        if (state.right)
+        {
+            watchdog_reboot(0, 0, 0);
+            while (1)
+                ;
+            menuOpen = 0;
+        }
+    }
+}
+
 static void on_map_event(uint8_t param1, uint8_t param2)
 {
     g_last_event_num = param1;
     g_last_event_step_on = param2 != 0;
     g_have_event = true;
+
+    if (param1 == 0 && param2 == 1)
+    {
+        flash_screen();
+        change_level(1);
+    }
+    else if (param1 == 1 && param2 == 1)
+    {
+        flash_screen();
+        change_level(2);
+    }
+    else if (param1 == 2 && param2 == 1)
+    {
+        flash_screen();
+        change_level(3);
+    }
+    else if (param1 == 3 && param2 == 1)
+    {
+        menuOpen = 100;
+    }
+}
+
+typedef struct
+{
+    bool active;
+    bool complete;
+    uint32_t run_id;
+    uint64_t start_us;
+    uint64_t elapsed_us;
+    uint64_t frame_time_total_us;
+    uint32_t recorded_samples;
+    uint32_t frames;
+    uint32_t min_frame_us;
+    uint32_t max_frame_us;
+    uint32_t frames_over_16ms;
+    uint32_t frames_over_33ms;
+} benchmark_state_t;
+
+static benchmark_state_t g_benchmark = {0};
+
+static void benchmark_start(uint64_t now_us)
+{
+    g_benchmark.active = true;
+    g_benchmark.complete = false;
+    g_benchmark.run_id++;
+    g_benchmark.start_us = now_us;
+    g_benchmark.elapsed_us = 0;
+    g_benchmark.frame_time_total_us = 0;
+    g_benchmark.recorded_samples = MovementRecorder_GetRecordedCount();
+    g_benchmark.frames = 0;
+    g_benchmark.min_frame_us = UINT32_MAX;
+    g_benchmark.max_frame_us = 0;
+    g_benchmark.frames_over_16ms = 0;
+    g_benchmark.frames_over_33ms = 0;
+}
+
+static void benchmark_add_frame(uint32_t frame_len_us)
+{
+    if (!g_benchmark.active)
+        return;
+    if (frame_len_us > BENCH_MAX_VALID_FRAME_US)
+        return;
+
+    g_benchmark.frames++;
+    g_benchmark.frame_time_total_us += frame_len_us;
+
+    if (frame_len_us < g_benchmark.min_frame_us)
+        g_benchmark.min_frame_us = frame_len_us;
+    if (frame_len_us > g_benchmark.max_frame_us)
+        g_benchmark.max_frame_us = frame_len_us;
+    if (frame_len_us > 16667u)
+        g_benchmark.frames_over_16ms++;
+    if (frame_len_us > 33333u)
+        g_benchmark.frames_over_33ms++;
+}
+
+static void benchmark_stop(uint64_t now_us)
+{
+    if (!g_benchmark.active)
+        return;
+
+    g_benchmark.active = false;
+    g_benchmark.complete = true;
+    g_benchmark.elapsed_us = now_us - g_benchmark.start_us;
+    if (g_benchmark.min_frame_us == UINT32_MAX)
+        g_benchmark.min_frame_us = 0;
+}
+
+static benchmark_snapshot_t benchmark_make_snapshot(uint64_t now_us)
+{
+    benchmark_snapshot_t snapshot = {0};
+    uint64_t elapsed_us = g_benchmark.active ? (now_us - g_benchmark.start_us) : g_benchmark.elapsed_us;
+    uint32_t playback_index = MovementRecorder_GetPlaybackIndex();
+
+    snapshot.active = g_benchmark.active ? 1u : 0u;
+    snapshot.complete = g_benchmark.complete ? 1u : 0u;
+    snapshot.run_id = g_benchmark.run_id;
+    snapshot.recorded_samples = g_benchmark.recorded_samples;
+    snapshot.frames = g_benchmark.frames;
+    snapshot.elapsed_ms = (uint32_t)(elapsed_us / 1000u);
+    snapshot.min_frame_us = g_benchmark.min_frame_us == UINT32_MAX ? 0 : g_benchmark.min_frame_us;
+    snapshot.max_frame_us = g_benchmark.max_frame_us;
+    snapshot.frames_over_16ms = g_benchmark.frames_over_16ms;
+    snapshot.frames_over_33ms = g_benchmark.frames_over_33ms;
+
+    if (g_benchmark.recorded_samples != 0)
+    {
+        if (playback_index > g_benchmark.recorded_samples)
+            playback_index = g_benchmark.recorded_samples;
+        snapshot.progress_permille = (playback_index * 1000u) / g_benchmark.recorded_samples;
+    }
+    else if (g_benchmark.complete)
+    {
+        snapshot.progress_permille = 1000u;
+    }
+
+    if (g_benchmark.frames != 0)
+        snapshot.avg_frame_us = (uint32_t)(g_benchmark.frame_time_total_us / g_benchmark.frames);
+    if (g_benchmark.frame_time_total_us != 0)
+        snapshot.avg_fps = (uint32_t)(((uint64_t)g_benchmark.frames * 1000000ull + (g_benchmark.frame_time_total_us / 2u)) / g_benchmark.frame_time_total_us);
+
+    return snapshot;
 }
 
 int main(void)
@@ -396,125 +767,151 @@ int main(void)
 
     MovementRecorder_Init();
 
-    map_t *current_map = &WallDemoMap;
-    const dialogue_t *current_dialogue = NULL;
-    millis_t use_press_ms = 0;
-    static entity_t entities[MAX_ENTITIES];
-
-    player_t camera;
-    camera.posX = FX(current_map->DefaultSpwanPoint[0]);
-    camera.posY = FX(current_map->DefaultSpwanPoint[1]);
+    change_level(0);
     camera.angle = FX_ANGLE_HALF;
     camera.dirX = fx_cos(camera.angle);
     camera.dirY = fx_sin(camera.angle);
     camera.planeX = fx_mul(camera.dirY, (fx_t)0x00a9);
     camera.planeY = fx_neg(fx_mul(camera.dirX, (fx_t)0x00a9));
+    for (int i = 0; i < 48 - 1; i++)
+        camera.zBuffer[i] = FX(64);
     camera.health = 5;
     camera.kills = 0;
     camera.currentItem = ITEM_HAND;
 
     MapEventCallback = on_map_event;
 
-entities[0].posX = FX(5);
-    entities[0].posY = FX(5);
-    entities[0].health = 100;
-    entities[0].sprite = &blobSprite;
-    entities[0].ratio = 0x00c0;
-    entities[0].heightOffset = FX(1);
-    entities[0].walking = 1;
-    entities[0].movementModifier = FX(1);
-    entities[0].lateralModifier = FX(1);
-    entities[0].hitDistance = FX(3);
-   
-    entities[1].posX = FX(8);
-    entities[1].posY = FX(8);
-    entities[1].health = 100;
-    entities[1].sprite = &ctyrruckaSprite;
-    entities[1].ratio = FX(1);
-    entities[1].heightOffset = FX(0);
-    entities[1].walking = 1;
-    entities[1].movementModifier = FX(2);  // 1.5625
-    entities[1].lateralModifier = FX(1);
-    entities[1].hitDistance = FX(4);
-
-    entities[2].posX = FX(3);
-    entities[2].posY = FX(3);
-    entities[2].health = 100;
-    entities[2].sprite = &chapadloSprite;
-    entities[2].ratio = 0X00C0;
-    entities[2].heightOffset = FX(0);
-    entities[2].walking = 1;
-    entities[2].movementModifier = 0X01C0;
-    entities[2].lateralModifier = FX(1);
-    entities[2].hitDistance = FX(6);
-
-    entities[3].posX = FX(6);
-    entities[3].posY = FX(2);
-    entities[3].health = 100;
-    entities[3].sprite = &soilderSprite;
-    entities[3].ratio = 0X0120;
-    entities[3].heightOffset = FX(0);
-    entities[3].walking = 1;
-    entities[3].movementModifier = FX(3);
-    entities[3].lateralModifier = FX(1);
-    entities[3].hitDistance = FX(20);
-    
-    entities[4].posX = FX(7);
-    entities[4].posY = FX(9);
-    entities[4].health = 100;
-    entities[4].sprite = &ctyrruckaSprite;
-    entities[4].ratio = FX(1);
-    entities[4].heightOffset = FX(0);
-    entities[4].walking = 0;
-
     bool prev_use = false;
+    bool dialogue_active = false;
     bool prev_debug_button = false;
-    publish_debug_snapshot(debug_page, &camera, current_map, false, 0, false, 0, 0, 0, to_us_since_boot(get_absolute_time()), MovementRecorder_GetStatus());
-    multicore_launch_core1(core1_debug_display_main);
+    uint64_t init_us = to_us_since_boot(get_absolute_time());
+    benchmark_snapshot_t benchmark_snapshot = benchmark_make_snapshot(init_us);
+    publish_debug_snapshot(debug_page, &camera, current_map, false, 0, false, 0, 0, 0, init_us, MovementRecorder_GetStatus(), &benchmark_snapshot);
 
     if (MovementRecorder_IsEmpty())
     {
         MovementRecorder_StartRecording();
     }
-    else MovementRecorder_StartReplay();
+    else
+        MovementRecorder_StartReplay();
+
+    multicore_launch_core1(core1_debug_display_main);
 
     while (true)
     {
         static absolute_time_t last_frame_complete = {0};
+        static uint64_t last_oled_present_us = 0;
+        static uint64_t last_game_update_us = 0;
+        static bool damage_flash_active = false;
         absolute_time_t frame_start = get_absolute_time();
         uint64_t frame_start_us = to_us_since_boot(frame_start);
+        movement_recorder_status_t status_at_frame_start = MovementRecorder_GetStatus();
+        bool game_frame_rendered = false;
+        bool update_game = (frame_start_us - last_game_update_us) >= GAME_UPDATE_INTERVAL_US;
+        uint32_t render_len_us = 1;
+        static buttons_t gameplay_buttons = {0};
+
+        if (status_at_frame_start == MOVEMENT_RECORDER_STATUS_REPLAYING && !g_benchmark.active)
+            benchmark_start(frame_start_us);
+
         millis = to_ms_since_boot(frame_start);
 
         buttons_t buttons = buttons_from_mask(read_buttons_mask());
-        MovementRecorder_CurrentValues(buttons);
-        if (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_REPLAYING)
-            buttons = MovementRecorder_GetPlaybackValues();
+        buttons_t unaltered_buttons = buttons;
+        static bool prevMenu = 0;
+        if (menuOpen == 0)
+        {
+            if (update_game)
+            {
+                if (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_RECORDING)
+                {
+                    MovementRecorder_CurrentValues(buttons);
+                    gameplay_buttons = buttons;
+                }
+                else if (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_REPLAYING)
+                {
+                    gameplay_buttons = MovementRecorder_GetPlaybackValues();
+                }
+                else
+                {
+                    gameplay_buttons = buttons;
+                }
+            }
 
-        MoveCamera(&camera, current_map, buttons, &current_dialogue);
+            uint64_t render_start_us = to_us_since_boot(get_absolute_time());
+            dogm128_clear();
+            if (update_game)
+            {
+                MoveCamera(&camera, current_map, gameplay_buttons, &current_dialogue, prevMenu);
+                last_game_update_us = frame_start_us;
+            }
+            RenderFrame(&camera, current_map);
+            game_frame_rendered = true;
+            if (current_map != &Level0Map && current_map != &Level1Map)
+            {
+                DrawEntities(&camera, entities, MAX_ENTITIES, dogm_fb, gameplay_buttons, current_map);
+                if (update_game)
+                    EnemyAi(&camera, entities, MAX_ENTITIES, current_map, prevMenu);
+            }
 
-        dogm128_clear();
-        RenderFrame(&camera, current_map);
-        DrawEntities(&camera, entities, MAX_ENTITIES, dogm_fb, buttons);
-        EnemyAi(&camera, entities, MAX_ENTITIES, current_map);
+            HUD_DrawBorders();
+            HUD_DrawItem(camera.currentItem);
+            HUD_DrawMap(current_map, &camera);
+            HUD_DrawCompass(camera.angle, camera.dirX, camera.dirY);
+            if (current_map != &Level0Map)
+            {
+                HUD_DrawBanner(current_map->Banner);
+                HUD_DrawStats(camera.health, camera.kills);
+                HUD_DrawItemPOV(camera.currentItem, use_press_ms + 200 > millis);
+            }
 
-        HUD_DrawBanner(current_map->Banner);
-        HUD_DrawBorders();
-        HUD_DrawItem(camera.currentItem);
-        HUD_DrawMap(current_map, &camera);
-        HUD_DrawCompass(&camera);
-        HUD_DrawStats(&camera);
+            bool use_pressed = false;
+            if (update_game)
+            {
+                use_pressed = gameplay_buttons.use && !prev_use;
+                prev_use = gameplay_buttons.use;
+            }
 
-        bool use_pressed = buttons.use && !prev_use;
-        prev_use = buttons.use;
+            dialogue_active = (current_dialogue != NULL);
+            if (use_pressed)
+                use_press_ms = millis;
 
-        bool dialogue_active = (current_dialogue != NULL);
-        if (use_pressed && !dialogue_active)
-            use_press_ms = millis;
+            HUD_DrawDialogue(&current_dialogue, update_game && use_pressed && dialogue_active);
 
-        HUD_DrawItemPOV(&camera, use_press_ms + 200 > millis);
-        HUD_DrawDialogue(&current_dialogue, use_pressed && dialogue_active);
+            if (camera.health == 0)
+            {
+                dogm128_fill_rect((96 / 2) - 25, (64 / 2) - 10, 50, 20, DISP_COL_WHITE);
+                dogm128_text((96 / 2) - 6, (57 / 2) - 2, "RIP");
+                menuOpen = 1;
+            }
 
-        set_LEDs(HUD_GetLEDHP(&camera));
+            set_LEDs(HUD_GetLEDHP(camera.health));
+            uint64_t render_end_us = to_us_since_boot(get_absolute_time());
+            render_len_us = (uint32_t)(render_end_us - render_start_us);
+            if (render_len_us == 0)
+                render_len_us = 1;
+            prevMenu = 0;
+        }
+        else
+            prevMenu = 1;
+
+        if (menuOpen == 100)
+        {
+            dogm128_fill_rect(0, 9, 96, 55, DISP_COL_WHITE);
+            dogm128_refresh();
+            sleep_ms(5000);
+            dogm128_text((96 / 2) - 20, (57 / 2) - 2, "YOU JUMPED");
+            dogm128_refresh();
+            sleep_ms(500);
+            menuOpen = 101;
+        }
+        if (menuOpen == 101)
+        {
+            dogm128_pixel(rand16() % 128, rand16() % 64, DISP_COL_BLACK);
+            sleep_ms(60);
+        }
+
+        DrawMenu(unaltered_buttons, camera.health == 0);
 
         absolute_time_t frame_end = get_absolute_time();
         uint64_t frame_end_us = to_us_since_boot(frame_end);
@@ -525,13 +922,26 @@ entities[0].posX = FX(5);
             frame_len_us = 1;
         if (frame_len_actual_us == 0)
             frame_len_actual_us = 1;
-        uint32_t fps = (1000000u + (frame_len_us / 2u)) / frame_len_us;
+        uint32_t fps = (1000000u + (render_len_us / 2u)) / render_len_us;
         uint32_t actual_fps = (1000000u + (frame_len_actual_us / 2u)) / frame_len_actual_us;
+        movement_recorder_status_t status_after_frame = MovementRecorder_GetStatus();
+
+        if (game_frame_rendered && g_benchmark.active && status_after_frame == MOVEMENT_RECORDER_STATUS_REPLAYING)
+            benchmark_add_frame(render_len_us);
+        if (g_benchmark.active && status_after_frame != MOVEMENT_RECORDER_STATUS_REPLAYING)
+        {
+            benchmark_stop(frame_end_us);
+            debug_page = DEBUG_PAGE_BENCH_SUMMARY;
+        }
 
         millis = to_ms_since_boot(frame_end);
 
-
-
+        bool should_flash_damage = (int32_t)(damageFlashUntilMs - millis) > 0;
+        if (should_flash_damage != damage_flash_active)
+        {
+            dogm128_contrast(should_flash_damage ? 0x30 : 0x8F);
+            damage_flash_active = should_flash_damage;
+        }
 
         // Toggle debug page on GP28 rising edge and also do button recording
         bool debug_button = read_debug_button();
@@ -545,36 +955,51 @@ entities[0].posX = FX(5);
         }
         if (millis - last_debug_button_press_ms >= 500 && debug_button)
         {
-            switch(MovementRecorder_GetStatus())
+            switch (MovementRecorder_GetStatus())
             {
-                case MOVEMENT_RECORDER_STATUS_IDLE:
-                    MovementRecorder_StartRecording();
-                    break;
-                case MOVEMENT_RECORDER_STATUS_RECORDING:
-                    MovementRecorder_StopRecording();
-                    MovementRecorder_StartReplay();
-                    break;
-                case MOVEMENT_RECORDER_STATUS_REPLAYING:
-                    MovementRecorder_StopReplay();
-                    break;
+            case MOVEMENT_RECORDER_STATUS_IDLE:
+                MovementRecorder_StartRecording();
+                break;
+            case MOVEMENT_RECORDER_STATUS_RECORDING:
+                MovementRecorder_StopRecording();
+                MovementRecorder_StartReplay();
+                benchmark_start(to_us_since_boot(get_absolute_time()));
+                break;
+            case MOVEMENT_RECORDER_STATUS_REPLAYING:
+                MovementRecorder_StopReplay();
+                break;
             }
             last_debug_button_press_ms = millis;
         }
         prev_debug_button = debug_button;
+        uint64_t publish_us = to_us_since_boot(get_absolute_time());
+        benchmark_snapshot = benchmark_make_snapshot(publish_us);
 
         publish_debug_snapshot(debug_page,
                                &camera,
                                current_map,
                                dialogue_active,
-                               buttons.all,
+                               gameplay_buttons.all,
                                debug_button,
                                fps,
                                actual_fps,
-                               frame_len_us,
-                               to_us_since_boot(get_absolute_time()),
-                               MovementRecorder_GetStatus());
+                               render_len_us,
+                               publish_us,
+                               MovementRecorder_GetStatus(),
+                               &benchmark_snapshot);
 
-        dogm128_refresh();
+        if (show_fps)
+        {
+            char buf[10];
+            utoa_mine((uint16_t)fps, buf, 0);
+            dogm128_text(0, 0, buf);
+        }
+
+        if (publish_us - last_oled_present_us >= OLED_PRESENT_INTERVAL_US)
+        {
+            dogm128_refresh();
+            last_oled_present_us = to_us_since_boot(get_absolute_time());
+        }
 
         // sleep_ms(1);
     }

@@ -15,6 +15,8 @@ typedef enum
 } movement_recorder_status_t;
 
 void MovementRecorder_Init(void);
+void MovementRecorder_Core1LockoutReady(void);
+void MovementRecorder_Clear(void);
 void MovementRecorder_StartRecording(void);
 void MovementRecorder_StopRecording(void);
 void MovementRecorder_StartReplay(void);
@@ -23,5 +25,7 @@ void MovementRecorder_CurrentValues(buttons_t buttons);
 bool MovementRecorder_IsEmpty(void);
 buttons_t MovementRecorder_GetPlaybackValues(void);
 movement_recorder_status_t MovementRecorder_GetStatus(void);
+uint32_t MovementRecorder_GetRecordedCount(void);
+uint32_t MovementRecorder_GetPlaybackIndex(void);
 
 #endif // MOVEMENT_RECORDER_H
