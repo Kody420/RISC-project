@@ -28,6 +28,19 @@ static const uint8_t LED_PINS[IO_COUNT] = {14, 12, 8, 4, 2};
 #define GAME_UPDATE_INTERVAL_US (1000000u / 173u)
 #define BENCH_MAX_VALID_FRAME_US 50000u
 #define BENCH_FPS_GRAPH_MAX 6000
+#define BENCH_SYNTHETIC_DURATION_US 15000000ull
+#define BENCH_MATH_CHUNK_OPS 100000u
+#define BENCH_LINE_CHUNK_OPS 1000u
+
+typedef enum
+{
+    BENCH_TEST_PLAYBACK = 0,
+    BENCH_TEST_ADD_SUB,
+    BENCH_TEST_MUL,
+    BENCH_TEST_XOR_SHIFT,
+    BENCH_TEST_LINES,
+    BENCH_TEST_COUNT,
+} benchmark_test_t;
 
 static uint8_t g_last_event_num = 0;
 static bool g_last_event_step_on = false;
@@ -40,6 +53,8 @@ static const dialogue_t *current_dialogue = NULL;
 static millis_t use_press_ms = 0;
 static bool show_fps = false;
 static uint8_t current_level_num = 0;
+static bool benchmark_menu_open = true;
+static benchmark_test_t selected_benchmark_test = BENCH_TEST_ADD_SUB;
 
 typedef enum
 {
@@ -136,6 +151,44 @@ static const char *build_arch_name(void)
 #endif
 }
 
+static const char *benchmark_test_name(benchmark_test_t test)
+{
+    switch (test)
+    {
+    case BENCH_TEST_PLAYBACK:
+        return "GAME";
+    case BENCH_TEST_ADD_SUB:
+        return "ADD";
+    case BENCH_TEST_MUL:
+        return "MUL";
+    case BENCH_TEST_XOR_SHIFT:
+        return "XOR";
+    case BENCH_TEST_LINES:
+        return "LINE";
+    default:
+        return "UNK";
+    }
+}
+
+static const char *benchmark_test_detail(benchmark_test_t test)
+{
+    switch (test)
+    {
+    case BENCH_TEST_PLAYBACK:
+        return "REC / REPLAY";
+    case BENCH_TEST_ADD_SUB:
+        return "ADD + SUB";
+    case BENCH_TEST_MUL:
+        return "INTEGER MUL";
+    case BENCH_TEST_XOR_SHIFT:
+        return "XORSHIFT";
+    case BENCH_TEST_LINES:
+        return "RANDOM LINES";
+    default:
+        return "";
+    }
+}
+
 typedef struct
 {
     fx_t posX;
@@ -150,9 +203,13 @@ typedef struct
 {
     uint8_t active;
     uint8_t complete;
+    benchmark_test_t test;
     uint32_t run_id;
     uint32_t progress_permille;
     uint32_t recorded_samples;
+    uint32_t work_done;
+    uint32_t work_total;
+    uint32_t checksum;
     uint32_t frames;
     uint32_t elapsed_ms;
     uint32_t avg_fps;
@@ -274,7 +331,7 @@ static void draw_debug_status_snapshot(const debug_display_snapshot_t *snapshot)
     st7789_draw_debug_cell_with_font(0, 3, line, debug_font, rgb565(255, 120, 120));
 
     if (snapshot->benchmark.active)
-        snprintf(line, sizeof(line), "B %lu%% %luF", (unsigned long)(snapshot->benchmark.progress_permille / 10u), (unsigned long)snapshot->benchmark.frames);
+        snprintf(line, sizeof(line), "%s %lu%%", benchmark_test_name(snapshot->benchmark.test), (unsigned long)(snapshot->benchmark.progress_permille / 10u));
     else if (snapshot->have_event)
         snprintf(line, sizeof(line), "EV %u%c", (unsigned)snapshot->last_event_num, snapshot->last_event_step_on ? '+' : '-');
     else
@@ -303,22 +360,28 @@ static void draw_debug_benchmark_summary(const debug_display_snapshot_t *snapsho
     const benchmark_snapshot_t *b = &snapshot->benchmark;
     char line[20];
 
-    snprintf(line, sizeof(line), "BENCH %s", b->active ? "RUN" : (b->complete ? "DONE" : "WAIT"));
+    snprintf(line, sizeof(line), "%s %s", benchmark_test_name(b->test), b->active ? "RUN" : (b->complete ? "DONE" : "WAIT"));
     st7789_draw_debug_cell_with_font(0, 0, line, debug_font, rgb565(255, 230, 80));
 
-    snprintf(line, sizeof(line), "FRAMES %lu", (unsigned long)b->frames);
+    snprintf(line, sizeof(line), "%s %lu", b->test == BENCH_TEST_PLAYBACK ? "FRM" : "RUNS", (unsigned long)b->work_done);
     st7789_draw_debug_cell_with_font(1, 0, line, debug_font, rgb565(220, 220, 220));
 
     snprintf(line, sizeof(line), "TIME %lums", (unsigned long)b->elapsed_ms);
     st7789_draw_debug_cell_with_font(2, 0, line, debug_font, rgb565(220, 220, 220));
 
-    snprintf(line, sizeof(line), "AVG %luFPS", (unsigned long)b->avg_fps);
+    if (b->test == BENCH_TEST_PLAYBACK)
+        snprintf(line, sizeof(line), "AVG %luFPS", (unsigned long)b->avg_fps);
+    else
+        snprintf(line, sizeof(line), "MRUN %lu", (unsigned long)(b->avg_fps / 1000000u));
     st7789_draw_debug_cell_with_font(0, 1, line, debug_font, rgb565(255, 255, 0));
 
     snprintf(line, sizeof(line), "AUS %lu", (unsigned long)b->avg_frame_us);
     st7789_draw_debug_cell_with_font(1, 1, line, debug_font, rgb565(170, 240, 255));
 
-    snprintf(line, sizeof(line), "SAMP %lu", (unsigned long)b->recorded_samples);
+    if (b->test == BENCH_TEST_PLAYBACK)
+        snprintf(line, sizeof(line), "TOT %lu", (unsigned long)b->work_total);
+    else
+        snprintf(line, sizeof(line), "LIM 15s");
     st7789_draw_debug_cell_with_font(2, 1, line, debug_font, rgb565(170, 240, 255));
 
     snprintf(line, sizeof(line), "MIN %lu", (unsigned long)b->min_frame_us);
@@ -336,7 +399,7 @@ static void draw_debug_benchmark_summary(const debug_display_snapshot_t *snapsho
     snprintf(line, sizeof(line), ">33 %lu", (unsigned long)b->frames_over_33ms);
     st7789_draw_debug_cell_with_font(1, 3, line, debug_font, rgb565(255, 190, 120));
 
-    snprintf(line, sizeof(line), "RUN %lu", (unsigned long)b->run_id);
+    snprintf(line, sizeof(line), "CHK %04lX", (unsigned long)(b->checksum & 0xFFFFu));
     st7789_draw_debug_cell_with_font(2, 3, line, debug_font, rgb565(200, 200, 200));
 }
 
@@ -385,14 +448,16 @@ static void draw_debug_benchmark_graph(const debug_display_snapshot_t *snapshot,
     char line[24];
 
     st7789_fill_rect(0, 0, ST7789_WIDTH, ST7789_HEIGHT, rgb565(0, 0, 0));
-    snprintf(line, sizeof(line), "RUN %lu %lu%%",
+    snprintf(line, sizeof(line), "%s %lu %lu%%",
+             benchmark_test_name(snapshot->benchmark.test),
              (unsigned long)snapshot->benchmark.run_id,
              (unsigned long)(snapshot->benchmark.progress_permille / 10u));
     st7789_draw_text(3, 3, ST7789_WIDTH - 2, line, debug_font, rgb565(255, 255, 255));
 
-    snprintf(line, sizeof(line), "%luF AVG %lu",
-             (unsigned long)snapshot->benchmark.frames,
-             (unsigned long)snapshot->benchmark.avg_fps);
+    snprintf(line, sizeof(line), "%s %lu AVG %lu",
+             snapshot->benchmark.test == BENCH_TEST_PLAYBACK ? "F" : "R",
+             (unsigned long)(snapshot->benchmark.test == BENCH_TEST_PLAYBACK ? snapshot->benchmark.frames : snapshot->benchmark.work_done),
+             (unsigned long)(snapshot->benchmark.test == BENCH_TEST_PLAYBACK ? snapshot->benchmark.avg_fps : snapshot->benchmark.avg_fps / 1000000u));
     st7789_draw_text(3, 14, ST7789_WIDTH - 2, line, debug_font, rgb565(255, 255, 0));
 
     plot_draw(bench_plot, true);
@@ -552,6 +617,9 @@ static void flash_screen(void)
 
 uint8_t menuOpen = 0;
 
+static void benchmark_start_playback(uint64_t now_us);
+static void benchmark_start_synthetic(benchmark_test_t test, uint64_t now_us);
+
 static void DrawMenu(buttons_t state, bool disallow_resume)
 {
     if (menuOpen == 0)
@@ -578,7 +646,7 @@ static void DrawMenu(buttons_t state, bool disallow_resume)
     }
     else
     {
-        dogm128_text(64 - 18, 64 - 5, "clear rec");
+            dogm128_text(64 - 18, 64 - 5, "clear recording");
     }
     dogm128_text(127 - 20, 64 - 5, "reset");
 
@@ -650,15 +718,108 @@ static void on_map_event(uint8_t param1, uint8_t param2)
     }
 }
 
+static void DrawBenchmarkMenu(buttons_t state)
+{
+    static buttons_t prev_state = {0};
+    buttons_t pressed = {.all = (uint8_t)(state.all & (uint8_t)~prev_state.all)};
+    char line[20];
+
+    if (pressed.front)
+        selected_benchmark_test = (benchmark_test_t)((selected_benchmark_test + 1) % BENCH_TEST_COUNT);
+    if (pressed.back)
+        selected_benchmark_test = (benchmark_test_t)((selected_benchmark_test + BENCH_TEST_COUNT - 1) % BENCH_TEST_COUNT);
+    if (pressed.right && MovementRecorder_GetStatus() != MOVEMENT_RECORDER_STATUS_IDLE)
+        benchmark_menu_open = false;
+    if (pressed.left)
+    {
+        MovementRecorder_Clear();
+    }
+    if (pressed.use)
+    {
+        benchmark_menu_open = false;
+        if (selected_benchmark_test == BENCH_TEST_PLAYBACK)
+        {
+            if (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_RECORDING)
+            {
+                MovementRecorder_StopRecording();
+                MovementRecorder_StartReplay();
+                benchmark_start_playback(to_us_since_boot(get_absolute_time()));
+                debug_page = DEBUG_PAGE_BENCH_GRAPH;
+            }
+            else if (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_REPLAYING)
+            {
+                MovementRecorder_StopReplay();
+                debug_page = DEBUG_PAGE_BENCH_SUMMARY;
+            }
+            else if (MovementRecorder_IsEmpty())
+            {
+                MovementRecorder_StartRecording();
+            }
+            else
+            {
+                MovementRecorder_StartReplay();
+                benchmark_start_playback(to_us_since_boot(get_absolute_time()));
+                debug_page = DEBUG_PAGE_BENCH_GRAPH;
+            }
+        }
+        else
+        {
+            if (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_RECORDING)
+                MovementRecorder_StopRecording();
+            else if (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_REPLAYING)
+                MovementRecorder_StopReplay();
+            benchmark_start_synthetic(selected_benchmark_test, to_us_since_boot(get_absolute_time()));
+            debug_page = DEBUG_PAGE_BENCH_GRAPH;
+        }
+    }
+
+    dogm128_fill_rect(0, 0, 128, 64, DISP_COL_WHITE);
+    dogm128_rect(0, 0, 128, 64, DISP_COL_BLACK);
+    dogm128_text(4, 4, "BENCHMARKS");
+
+    snprintf(line, sizeof(line), "< %s >", benchmark_test_name(selected_benchmark_test));
+    dogm128_text(4, 16, line);
+    dogm128_text(4, 24, benchmark_test_detail(selected_benchmark_test));
+
+    if (selected_benchmark_test == BENCH_TEST_PLAYBACK)
+    {
+        switch (MovementRecorder_GetStatus())
+        {
+        case MOVEMENT_RECORDER_STATUS_RECORDING:
+            dogm128_text(4, 34, "USE: STOP+REPLAY");
+            break;
+        case MOVEMENT_RECORDER_STATUS_REPLAYING:
+            dogm128_text(4, 34, "USE: STOP REPLAY");
+            break;
+        default:
+            dogm128_text(4, 34, MovementRecorder_IsEmpty() ? "USE: RECORD" : "USE: REPLAY");
+            break;
+        }
+    }
+    else
+    {
+        dogm128_text(4, 34, "USE: RUN TEST");
+    }
+
+    dogm128_text(4, 46, "FRONT/BACK: SELECT");
+    dogm128_text(4, 54, MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_IDLE ? "LEFT: CLEAR RECORDING" : "LEFT: CLEAR RECORDING");
+
+    prev_state = state;
+}
+
 typedef struct
 {
     bool active;
     bool complete;
+    benchmark_test_t test;
     uint32_t run_id;
     uint64_t start_us;
     uint64_t elapsed_us;
     uint64_t frame_time_total_us;
     uint32_t recorded_samples;
+    uint32_t work_done;
+    uint32_t work_total;
+    uint32_t checksum;
     uint32_t frames;
     uint32_t min_frame_us;
     uint32_t max_frame_us;
@@ -667,21 +828,39 @@ typedef struct
 } benchmark_state_t;
 
 static benchmark_state_t g_benchmark = {0};
+static volatile uint32_t g_benchmark_sink = 0;
 
-static void benchmark_start(uint64_t now_us)
+static void benchmark_start_common(benchmark_test_t test, uint64_t now_us)
 {
     g_benchmark.active = true;
     g_benchmark.complete = false;
+    g_benchmark.test = test;
     g_benchmark.run_id++;
     g_benchmark.start_us = now_us;
     g_benchmark.elapsed_us = 0;
     g_benchmark.frame_time_total_us = 0;
-    g_benchmark.recorded_samples = MovementRecorder_GetRecordedCount();
+    g_benchmark.recorded_samples = 0;
+    g_benchmark.work_done = 0;
+    g_benchmark.work_total = 0;
+    g_benchmark.checksum = 0x12345678u;
     g_benchmark.frames = 0;
     g_benchmark.min_frame_us = UINT32_MAX;
     g_benchmark.max_frame_us = 0;
     g_benchmark.frames_over_16ms = 0;
     g_benchmark.frames_over_33ms = 0;
+}
+
+static void benchmark_start_playback(uint64_t now_us)
+{
+    benchmark_start_common(BENCH_TEST_PLAYBACK, now_us);
+    g_benchmark.recorded_samples = MovementRecorder_GetRecordedCount();
+    g_benchmark.work_total = g_benchmark.recorded_samples;
+}
+
+static void benchmark_start_synthetic(benchmark_test_t test, uint64_t now_us)
+{
+    benchmark_start_common(test, now_us);
+    g_benchmark.work_total = 15u;
 }
 
 static void benchmark_add_frame(uint32_t frame_len_us)
@@ -724,8 +903,12 @@ static benchmark_snapshot_t benchmark_make_snapshot(uint64_t now_us)
 
     snapshot.active = g_benchmark.active ? 1u : 0u;
     snapshot.complete = g_benchmark.complete ? 1u : 0u;
+    snapshot.test = g_benchmark.test;
     snapshot.run_id = g_benchmark.run_id;
     snapshot.recorded_samples = g_benchmark.recorded_samples;
+    snapshot.work_done = g_benchmark.work_done;
+    snapshot.work_total = g_benchmark.work_total;
+    snapshot.checksum = g_benchmark.checksum;
     snapshot.frames = g_benchmark.frames;
     snapshot.elapsed_ms = (uint32_t)(elapsed_us / 1000u);
     snapshot.min_frame_us = g_benchmark.min_frame_us == UINT32_MAX ? 0 : g_benchmark.min_frame_us;
@@ -733,11 +916,18 @@ static benchmark_snapshot_t benchmark_make_snapshot(uint64_t now_us)
     snapshot.frames_over_16ms = g_benchmark.frames_over_16ms;
     snapshot.frames_over_33ms = g_benchmark.frames_over_33ms;
 
-    if (g_benchmark.recorded_samples != 0)
+    if (g_benchmark.test == BENCH_TEST_PLAYBACK && g_benchmark.recorded_samples != 0)
     {
         if (playback_index > g_benchmark.recorded_samples)
             playback_index = g_benchmark.recorded_samples;
         snapshot.progress_permille = (playback_index * 1000u) / g_benchmark.recorded_samples;
+    }
+    else if (g_benchmark.test != BENCH_TEST_PLAYBACK)
+    {
+        if (elapsed_us >= BENCH_SYNTHETIC_DURATION_US)
+            snapshot.progress_permille = 1000u;
+        else
+            snapshot.progress_permille = (uint32_t)((elapsed_us * 1000ull) / BENCH_SYNTHETIC_DURATION_US);
     }
     else if (g_benchmark.complete)
     {
@@ -746,10 +936,124 @@ static benchmark_snapshot_t benchmark_make_snapshot(uint64_t now_us)
 
     if (g_benchmark.frames != 0)
         snapshot.avg_frame_us = (uint32_t)(g_benchmark.frame_time_total_us / g_benchmark.frames);
-    if (g_benchmark.frame_time_total_us != 0)
+    if (g_benchmark.frame_time_total_us != 0 && g_benchmark.test == BENCH_TEST_PLAYBACK)
         snapshot.avg_fps = (uint32_t)(((uint64_t)g_benchmark.frames * 1000000ull + (g_benchmark.frame_time_total_us / 2u)) / g_benchmark.frame_time_total_us);
+    else if (elapsed_us != 0)
+        snapshot.avg_fps = (uint32_t)(((uint64_t)g_benchmark.work_done * 1000000ull + (elapsed_us / 2u)) / elapsed_us);
 
     return snapshot;
+}
+
+static void DrawBenchmarkStatusScreen(const benchmark_snapshot_t *snapshot)
+{
+    char line[24];
+
+    dogm128_fill_rect(0, 0, 128, 64, DISP_COL_WHITE);
+    dogm128_rect(0, 0, 128, 64, DISP_COL_BLACK);
+
+    snprintf(line, sizeof(line), "%s %s",
+             benchmark_test_name(snapshot->test),
+             snapshot->active ? "RUNNING" : "DONE");
+    dogm128_text(4, 4, line);
+
+    snprintf(line, sizeof(line), "PROGRESS %lu%%", (unsigned long)(snapshot->progress_permille / 10u));
+    dogm128_text(4, 16, line);
+    dogm128_rect(4, 25, 120, 8, DISP_COL_BLACK);
+    dogm128_fill_rect(6, 27, (uint8_t)((snapshot->progress_permille * 116u) / 1000u), 4, DISP_COL_BLACK);
+
+    snprintf(line, sizeof(line), "%s %lu",
+             snapshot->test == BENCH_TEST_PLAYBACK ? "FRAMES" : "RUNS",
+             (unsigned long)(snapshot->test == BENCH_TEST_PLAYBACK ? snapshot->frames : snapshot->work_done));
+    dogm128_text(4, 38, line);
+
+    if (snapshot->test == BENCH_TEST_PLAYBACK)
+        snprintf(line, sizeof(line), "AVG %lu FPS", (unsigned long)snapshot->avg_fps);
+    else
+        snprintf(line, sizeof(line), "AVG %lu MRUN", (unsigned long)(snapshot->avg_fps / 1000000u));
+    dogm128_text(4, 48, line);
+
+    snprintf(line, sizeof(line), "TIME %lus", (unsigned long)(snapshot->elapsed_ms / 1000u));
+    dogm128_text(4, 56, line);
+}
+
+static bool benchmark_is_synthetic_active(void)
+{
+    return g_benchmark.active && g_benchmark.test != BENCH_TEST_PLAYBACK;
+}
+
+static uint32_t bench_next_rand(uint32_t *state)
+{
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+static void benchmark_run_synthetic_chunk(uint64_t now_us)
+{
+    uint32_t chunk;
+    uint64_t chunk_start_us;
+    uint64_t chunk_end_us;
+    uint32_t x = g_benchmark.checksum;
+
+    if (!benchmark_is_synthetic_active())
+        return;
+    if (now_us - g_benchmark.start_us >= BENCH_SYNTHETIC_DURATION_US)
+    {
+        benchmark_stop(now_us);
+        return;
+    }
+
+    chunk = (g_benchmark.test == BENCH_TEST_LINES) ? BENCH_LINE_CHUNK_OPS : BENCH_MATH_CHUNK_OPS;
+
+    chunk_start_us = to_us_since_boot(get_absolute_time());
+
+    switch (g_benchmark.test)
+    {
+    case BENCH_TEST_ADD_SUB:
+        for (uint32_t i = 0; i < chunk; ++i)
+        {
+            x += i + 3u;
+            x -= i ^ 0x5A5A5A5Au;
+        }
+        break;
+    case BENCH_TEST_MUL:
+        for (uint32_t i = 0; i < chunk; ++i)
+            x = (x * 1664525u) + (i | 1u);
+        break;
+    case BENCH_TEST_XOR_SHIFT:
+        for (uint32_t i = 0; i < chunk; ++i)
+            x = bench_next_rand(&x);
+        break;
+    case BENCH_TEST_LINES:
+        for (uint32_t i = 0; i < chunk; ++i)
+        {
+            uint32_t r0 = bench_next_rand(&x);
+            uint32_t r1 = bench_next_rand(&x);
+            dogm128_line((int)(r0 & 127u),
+                         (int)((r0 >> 8) & 63u),
+                         (int)(r1 & 127u),
+                         (int)((r1 >> 8) & 63u),
+                         (r1 & 0x10000u) ? DISP_COL_BLACK : DISP_COL_WHITE);
+        }
+        break;
+    default:
+        break;
+    }
+
+    chunk_end_us = to_us_since_boot(get_absolute_time());
+    if (chunk_end_us == chunk_start_us)
+        chunk_end_us++;
+
+    g_benchmark_sink = x;
+    g_benchmark.checksum = x;
+    g_benchmark.work_done += chunk;
+    benchmark_add_frame((uint32_t)(chunk_end_us - chunk_start_us));
+
+    if (chunk_end_us - g_benchmark.start_us >= BENCH_SYNTHETIC_DURATION_US)
+        benchmark_stop(chunk_end_us);
 }
 
 int main(void)
@@ -788,13 +1092,6 @@ int main(void)
     benchmark_snapshot_t benchmark_snapshot = benchmark_make_snapshot(init_us);
     publish_debug_snapshot(debug_page, &camera, current_map, false, 0, false, 0, 0, 0, init_us, MovementRecorder_GetStatus(), &benchmark_snapshot);
 
-    if (MovementRecorder_IsEmpty())
-    {
-        MovementRecorder_StartRecording();
-    }
-    else
-        MovementRecorder_StartReplay();
-
     multicore_launch_core1(core1_debug_display_main);
 
     while (true)
@@ -811,15 +1108,31 @@ int main(void)
         uint32_t render_len_us = 1;
         static buttons_t gameplay_buttons = {0};
 
-        if (status_at_frame_start == MOVEMENT_RECORDER_STATUS_REPLAYING && !g_benchmark.active)
-            benchmark_start(frame_start_us);
+        if (!benchmark_menu_open &&
+            selected_benchmark_test == BENCH_TEST_PLAYBACK &&
+            status_at_frame_start == MOVEMENT_RECORDER_STATUS_REPLAYING &&
+            !g_benchmark.active)
+            benchmark_start_playback(frame_start_us);
 
         millis = to_ms_since_boot(frame_start);
 
         buttons_t buttons = buttons_from_mask(read_buttons_mask());
         buttons_t unaltered_buttons = buttons;
+        bool synthetic_benchmark_active = benchmark_is_synthetic_active();
+        bool game_benchmark_active =
+            !benchmark_menu_open &&
+            selected_benchmark_test == BENCH_TEST_PLAYBACK &&
+            (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_RECORDING ||
+             MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_REPLAYING);
+        if (synthetic_benchmark_active)
+        {
+            benchmark_run_synthetic_chunk(frame_start_us);
+            if (!benchmark_is_synthetic_active())
+                debug_page = DEBUG_PAGE_BENCH_SUMMARY;
+        }
+
         static bool prevMenu = 0;
-        if (menuOpen == 0)
+        if (menuOpen == 0 && game_benchmark_active)
         {
             if (update_game)
             {
@@ -895,7 +1208,7 @@ int main(void)
         else
             prevMenu = 1;
 
-        if (menuOpen == 100)
+        if (game_benchmark_active && menuOpen == 100)
         {
             dogm128_fill_rect(0, 9, 96, 55, DISP_COL_WHITE);
             dogm128_refresh();
@@ -905,13 +1218,16 @@ int main(void)
             sleep_ms(500);
             menuOpen = 101;
         }
-        if (menuOpen == 101)
+        if (game_benchmark_active && menuOpen == 101)
         {
             dogm128_pixel(rand16() % 128, rand16() % 64, DISP_COL_BLACK);
             sleep_ms(60);
         }
 
-        DrawMenu(unaltered_buttons, camera.health == 0);
+        if (benchmark_menu_open)
+            DrawBenchmarkMenu(unaltered_buttons);
+        else if (game_benchmark_active)
+            DrawMenu(unaltered_buttons, camera.health == 0);
 
         absolute_time_t frame_end = get_absolute_time();
         uint64_t frame_end_us = to_us_since_boot(frame_end);
@@ -926,9 +1242,9 @@ int main(void)
         uint32_t actual_fps = (1000000u + (frame_len_actual_us / 2u)) / frame_len_actual_us;
         movement_recorder_status_t status_after_frame = MovementRecorder_GetStatus();
 
-        if (game_frame_rendered && g_benchmark.active && status_after_frame == MOVEMENT_RECORDER_STATUS_REPLAYING)
+        if (game_frame_rendered && g_benchmark.active && g_benchmark.test == BENCH_TEST_PLAYBACK && status_after_frame == MOVEMENT_RECORDER_STATUS_REPLAYING)
             benchmark_add_frame(render_len_us);
-        if (g_benchmark.active && status_after_frame != MOVEMENT_RECORDER_STATUS_REPLAYING)
+        if (g_benchmark.active && g_benchmark.test == BENCH_TEST_PLAYBACK && status_after_frame != MOVEMENT_RECORDER_STATUS_REPLAYING)
         {
             benchmark_stop(frame_end_us);
             debug_page = DEBUG_PAGE_BENCH_SUMMARY;
@@ -943,37 +1259,32 @@ int main(void)
             damage_flash_active = should_flash_damage;
         }
 
-        // Toggle debug page on GP28 rising edge and also do button recording
+        // Short press cycles debug pages; long press opens the benchmark menu.
         bool debug_button = read_debug_button();
         static millis_t last_debug_button_press_ms = 0;
         if (debug_button != prev_debug_button)
             last_debug_button_press_ms = millis;
-        if (!debug_button && prev_debug_button && (millis - last_debug_button_press_ms < 500))
+        if (!benchmark_menu_open && !debug_button && prev_debug_button && (millis - last_debug_button_press_ms < 500))
         {
             pageCycle();
             last_debug_button_press_ms = millis;
         }
         if (millis - last_debug_button_press_ms >= 500 && debug_button)
         {
-            switch (MovementRecorder_GetStatus())
-            {
-            case MOVEMENT_RECORDER_STATUS_IDLE:
-                MovementRecorder_StartRecording();
-                break;
-            case MOVEMENT_RECORDER_STATUS_RECORDING:
-                MovementRecorder_StopRecording();
-                MovementRecorder_StartReplay();
-                benchmark_start(to_us_since_boot(get_absolute_time()));
-                break;
-            case MOVEMENT_RECORDER_STATUS_REPLAYING:
+            if (MovementRecorder_GetStatus() == MOVEMENT_RECORDER_STATUS_REPLAYING)
                 MovementRecorder_StopReplay();
-                break;
+            if (benchmark_is_synthetic_active())
+            {
+                benchmark_stop(to_us_since_boot(get_absolute_time()));
+                debug_page = DEBUG_PAGE_BENCH_SUMMARY;
             }
+            benchmark_menu_open = true;
             last_debug_button_press_ms = millis;
         }
         prev_debug_button = debug_button;
         uint64_t publish_us = to_us_since_boot(get_absolute_time());
         benchmark_snapshot = benchmark_make_snapshot(publish_us);
+        uint32_t display_fps = benchmark_is_synthetic_active() ? (benchmark_snapshot.avg_fps / 1000000u) : fps;
 
         publish_debug_snapshot(debug_page,
                                &camera,
@@ -981,12 +1292,19 @@ int main(void)
                                dialogue_active,
                                gameplay_buttons.all,
                                debug_button,
-                               fps,
+                               display_fps,
                                actual_fps,
                                render_len_us,
                                publish_us,
                                MovementRecorder_GetStatus(),
                                &benchmark_snapshot);
+
+        if (!benchmark_menu_open &&
+            !game_benchmark_active &&
+            (benchmark_snapshot.active || benchmark_snapshot.complete))
+        {
+            DrawBenchmarkStatusScreen(&benchmark_snapshot);
+        }
 
         if (show_fps)
         {
