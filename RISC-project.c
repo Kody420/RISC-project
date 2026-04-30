@@ -31,6 +31,8 @@ static const uint8_t LED_PINS[IO_COUNT] = {14, 12, 8, 4, 2};
 #define BENCH_SYNTHETIC_DURATION_US 15000000ull
 #define BENCH_MATH_CHUNK_OPS 100000u
 #define BENCH_LINE_CHUNK_OPS 1000u
+#define BENCH_RENDER_CHUNK_OPS 20u
+#define BENCH_MEMCPY_SIZE 1024u
 
 typedef enum
 {
@@ -39,6 +41,12 @@ typedef enum
     BENCH_TEST_MUL,
     BENCH_TEST_XOR_SHIFT,
     BENCH_TEST_LINES,
+    BENCH_TEST_DIV,
+    BENCH_TEST_MIX,
+    BENCH_TEST_BRANCH,
+    BENCH_TEST_MEMCPY,
+    BENCH_TEST_RAYCAST,
+    BENCH_TEST_ENTITIES,
     BENCH_TEST_COUNT,
 } benchmark_test_t;
 
@@ -165,6 +173,18 @@ static const char *benchmark_test_name(benchmark_test_t test)
         return "XOR";
     case BENCH_TEST_LINES:
         return "LINE";
+    case BENCH_TEST_DIV:
+        return "DIV";
+    case BENCH_TEST_MIX:
+        return "MIX";
+    case BENCH_TEST_BRANCH:
+        return "BRANCH";
+    case BENCH_TEST_MEMCPY:
+        return "MEMCPY";
+    case BENCH_TEST_RAYCAST:
+        return "RAY";
+    case BENCH_TEST_ENTITIES:
+        return "ENTITY";
     default:
         return "UNK";
     }
@@ -184,10 +204,24 @@ static const char *benchmark_test_detail(benchmark_test_t test)
         return "XORSHIFT";
     case BENCH_TEST_LINES:
         return "RANDOM LINES";
+    case BENCH_TEST_DIV:
+        return "DIV + MOD";
+    case BENCH_TEST_MIX:
+        return "MIXED ALU";
+    case BENCH_TEST_BRANCH:
+        return "BRANCHES";
+    case BENCH_TEST_MEMCPY:
+        return "1KB COPIES";
+    case BENCH_TEST_RAYCAST:
+        return "FIXED RENDER";
+    case BENCH_TEST_ENTITIES:
+        return "ENTITY DRAW";
     default:
         return "";
     }
 }
+
+static bool benchmark_test_is_render(benchmark_test_t test);
 
 typedef struct
 {
@@ -363,7 +397,9 @@ static void draw_debug_benchmark_summary(const debug_display_snapshot_t *snapsho
     snprintf(line, sizeof(line), "%s %s", benchmark_test_name(b->test), b->active ? "RUN" : (b->complete ? "DONE" : "WAIT"));
     st7789_draw_debug_cell_with_font(0, 0, line, debug_font, rgb565(255, 230, 80));
 
-    snprintf(line, sizeof(line), "%s %lu", b->test == BENCH_TEST_PLAYBACK ? "FRM" : "RUNS", (unsigned long)b->work_done);
+    snprintf(line, sizeof(line), "%s %lu",
+             b->test == BENCH_TEST_PLAYBACK ? "FRM" : "RUNS",
+             (unsigned long)(b->test == BENCH_TEST_PLAYBACK ? b->frames : b->work_done));
     st7789_draw_debug_cell_with_font(1, 0, line, debug_font, rgb565(220, 220, 220));
 
     snprintf(line, sizeof(line), "TIME %lums", (unsigned long)b->elapsed_ms);
@@ -371,6 +407,8 @@ static void draw_debug_benchmark_summary(const debug_display_snapshot_t *snapsho
 
     if (b->test == BENCH_TEST_PLAYBACK)
         snprintf(line, sizeof(line), "AVG %luFPS", (unsigned long)b->avg_fps);
+    else if (benchmark_test_is_render(b->test))
+        snprintf(line, sizeof(line), "RPS %lu", (unsigned long)b->avg_fps);
     else
         snprintf(line, sizeof(line), "MRUN %lu", (unsigned long)(b->avg_fps / 1000000u));
     st7789_draw_debug_cell_with_font(0, 1, line, debug_font, rgb565(255, 255, 0));
@@ -457,7 +495,7 @@ static void draw_debug_benchmark_graph(const debug_display_snapshot_t *snapshot,
     snprintf(line, sizeof(line), "%s %lu AVG %lu",
              snapshot->benchmark.test == BENCH_TEST_PLAYBACK ? "F" : "R",
              (unsigned long)(snapshot->benchmark.test == BENCH_TEST_PLAYBACK ? snapshot->benchmark.frames : snapshot->benchmark.work_done),
-             (unsigned long)(snapshot->benchmark.test == BENCH_TEST_PLAYBACK ? snapshot->benchmark.avg_fps : snapshot->benchmark.avg_fps / 1000000u));
+             (unsigned long)(snapshot->benchmark.test == BENCH_TEST_PLAYBACK || benchmark_test_is_render(snapshot->benchmark.test) ? snapshot->benchmark.avg_fps : snapshot->benchmark.avg_fps / 1000000u));
     st7789_draw_text(3, 14, ST7789_WIDTH - 2, line, debug_font, rgb565(255, 255, 0));
 
     plot_draw(bench_plot, true);
@@ -829,6 +867,49 @@ typedef struct
 
 static benchmark_state_t g_benchmark = {0};
 static volatile uint32_t g_benchmark_sink = 0;
+static player_t g_bench_player;
+static entity_t g_bench_entities[MAX_ENTITIES];
+static uint8_t g_bench_mem_src[BENCH_MEMCPY_SIZE];
+static uint8_t g_bench_mem_dst[BENCH_MEMCPY_SIZE];
+
+static uint32_t bench_next_rand(uint32_t *state);
+
+static void benchmark_prepare_render_scene(void)
+{
+    memset(&g_bench_player, 0, sizeof(g_bench_player));
+    g_bench_player.posX = FX(Level3Map.DefaultSpwanPoint[0]);
+    g_bench_player.posY = FX(Level3Map.DefaultSpwanPoint[1]);
+    g_bench_player.angle = FX_ANGLE_HALF;
+    g_bench_player.dirX = fx_cos(g_bench_player.angle);
+    g_bench_player.dirY = fx_sin(g_bench_player.angle);
+    g_bench_player.planeX = fx_mul(g_bench_player.dirY, (fx_t)0x00a9);
+    g_bench_player.planeY = fx_neg(fx_mul(g_bench_player.dirX, (fx_t)0x00a9));
+    g_bench_player.health = 5;
+    g_bench_player.currentItem = ITEM_HAND;
+
+    for (int i = 0; i < 48 - 1; i++)
+        g_bench_player.zBuffer[i] = FX(64);
+
+    for (uint8_t i = 0; i < MAX_ENTITIES; i++)
+    {
+        memcpy(&g_bench_entities[i], &soilderTemplate, sizeof(entity_t));
+        RespawnEntity(&Level3Map, &g_bench_entities[i]);
+    }
+
+    RenderFrame(&g_bench_player, &Level3Map);
+}
+
+static void benchmark_prepare_memcpy_buffers(void)
+{
+    uint32_t x = 0xA5A5C3C3u;
+
+    for (uint16_t i = 0; i < BENCH_MEMCPY_SIZE; ++i)
+    {
+        x = bench_next_rand(&x);
+        g_bench_mem_src[i] = (uint8_t)x;
+        g_bench_mem_dst[i] = 0;
+    }
+}
 
 static void benchmark_start_common(benchmark_test_t test, uint64_t now_us)
 {
@@ -861,6 +942,11 @@ static void benchmark_start_synthetic(benchmark_test_t test, uint64_t now_us)
 {
     benchmark_start_common(test, now_us);
     g_benchmark.work_total = 15u;
+
+    if (test == BENCH_TEST_RAYCAST || test == BENCH_TEST_ENTITIES)
+        benchmark_prepare_render_scene();
+    if (test == BENCH_TEST_MEMCPY)
+        benchmark_prepare_memcpy_buffers();
 }
 
 static void benchmark_add_frame(uint32_t frame_len_us)
@@ -968,6 +1054,8 @@ static void DrawBenchmarkStatusScreen(const benchmark_snapshot_t *snapshot)
 
     if (snapshot->test == BENCH_TEST_PLAYBACK)
         snprintf(line, sizeof(line), "AVG %lu FPS", (unsigned long)snapshot->avg_fps);
+    else if (benchmark_test_is_render(snapshot->test))
+        snprintf(line, sizeof(line), "AVG %lu RPS", (unsigned long)snapshot->avg_fps);
     else
         snprintf(line, sizeof(line), "AVG %lu MRUN", (unsigned long)(snapshot->avg_fps / 1000000u));
     dogm128_text(4, 48, line);
@@ -979,6 +1067,11 @@ static void DrawBenchmarkStatusScreen(const benchmark_snapshot_t *snapshot)
 static bool benchmark_is_synthetic_active(void)
 {
     return g_benchmark.active && g_benchmark.test != BENCH_TEST_PLAYBACK;
+}
+
+static bool benchmark_test_is_render(benchmark_test_t test)
+{
+    return test == BENCH_TEST_RAYCAST || test == BENCH_TEST_ENTITIES;
 }
 
 static uint32_t bench_next_rand(uint32_t *state)
@@ -1006,7 +1099,12 @@ static void benchmark_run_synthetic_chunk(uint64_t now_us)
         return;
     }
 
-    chunk = (g_benchmark.test == BENCH_TEST_LINES) ? BENCH_LINE_CHUNK_OPS : BENCH_MATH_CHUNK_OPS;
+    if (g_benchmark.test == BENCH_TEST_LINES)
+        chunk = BENCH_LINE_CHUNK_OPS;
+    else if (benchmark_test_is_render(g_benchmark.test))
+        chunk = BENCH_RENDER_CHUNK_OPS;
+    else
+        chunk = BENCH_MATH_CHUNK_OPS;
 
     chunk_start_us = to_us_since_boot(get_absolute_time());
 
@@ -1027,6 +1125,42 @@ static void benchmark_run_synthetic_chunk(uint64_t now_us)
         for (uint32_t i = 0; i < chunk; ++i)
             x = bench_next_rand(&x);
         break;
+    case BENCH_TEST_DIV:
+        for (uint32_t i = 0; i < chunk; ++i)
+        {
+            uint32_t d = (i | 1u) + ((x >> 24) & 31u);
+            x += (0xFEDCBA98u / d);
+            x ^= (0x76543210u % d);
+        }
+        break;
+    case BENCH_TEST_MIX:
+        for (uint32_t i = 0; i < chunk; ++i)
+        {
+            x += i * 33u;
+            x ^= x << 7;
+            x -= 0x9E3779B9u;
+            x = (x << 11) | (x >> 21);
+            x *= 3u;
+        }
+        break;
+    case BENCH_TEST_BRANCH:
+        for (uint32_t i = 0; i < chunk; ++i)
+        {
+            x = bench_next_rand(&x);
+            if (x & 1u)
+                x += i ^ 0x13579BDFu;
+            else
+                x -= i | 0x2468ACE0u;
+        }
+        break;
+    case BENCH_TEST_MEMCPY:
+        for (uint32_t i = 0; i < chunk; ++i)
+        {
+            g_bench_mem_src[(uint16_t)(i & (BENCH_MEMCPY_SIZE - 1u))] ^= (uint8_t)x;
+            memcpy(g_bench_mem_dst, g_bench_mem_src, BENCH_MEMCPY_SIZE);
+            x += g_bench_mem_dst[(uint16_t)(x & (BENCH_MEMCPY_SIZE - 1u))];
+        }
+        break;
     case BENCH_TEST_LINES:
         for (uint32_t i = 0; i < chunk; ++i)
         {
@@ -1037,6 +1171,26 @@ static void benchmark_run_synthetic_chunk(uint64_t now_us)
                          (int)(r1 & 127u),
                          (int)((r1 >> 8) & 63u),
                          (r1 & 0x10000u) ? DISP_COL_BLACK : DISP_COL_WHITE);
+        }
+        break;
+    case BENCH_TEST_RAYCAST:
+        for (uint32_t i = 0; i < chunk; ++i)
+        {
+            g_bench_player.angle = (fx_t)(g_bench_player.angle + 1);
+            g_bench_player.dirX = fx_cos(g_bench_player.angle);
+            g_bench_player.dirY = fx_sin(g_bench_player.angle);
+            g_bench_player.planeX = fx_mul(g_bench_player.dirY, (fx_t)0x00a9);
+            g_bench_player.planeY = fx_neg(fx_mul(g_bench_player.dirX, (fx_t)0x00a9));
+            RenderFrame(&g_bench_player, &Level3Map);
+            x += (uint32_t)g_bench_player.zBuffer[i % (48 - 1)];
+        }
+        break;
+    case BENCH_TEST_ENTITIES:
+        for (uint32_t i = 0; i < chunk; ++i)
+        {
+            buttons_t no_buttons = {0};
+            DrawEntities(&g_bench_player, g_bench_entities, MAX_ENTITIES, dogm_fb, no_buttons, &Level3Map);
+            x += (uint32_t)g_bench_entities[i % MAX_ENTITIES].distance;
         }
         break;
     default:
@@ -1284,7 +1438,9 @@ int main(void)
         prev_debug_button = debug_button;
         uint64_t publish_us = to_us_since_boot(get_absolute_time());
         benchmark_snapshot = benchmark_make_snapshot(publish_us);
-        uint32_t display_fps = benchmark_is_synthetic_active() ? (benchmark_snapshot.avg_fps / 1000000u) : fps;
+        uint32_t display_fps = fps;
+        if (benchmark_is_synthetic_active())
+            display_fps = benchmark_test_is_render(benchmark_snapshot.test) ? benchmark_snapshot.avg_fps : (benchmark_snapshot.avg_fps / 1000000u);
 
         publish_debug_snapshot(debug_page,
                                &camera,
