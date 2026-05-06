@@ -1123,7 +1123,11 @@ static void benchmark_run_synthetic_chunk(uint64_t now_us)
         break;
     case BENCH_TEST_XOR_SHIFT:
         for (uint32_t i = 0; i < chunk; ++i)
-            x = bench_next_rand(&x);
+        {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+        }
         break;
     case BENCH_TEST_DIV:
         for (uint32_t i = 0; i < chunk; ++i)

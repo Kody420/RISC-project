@@ -36,6 +36,8 @@ bench_test_add_sub:
     ret
 ```
 
+- RISC V architektura má O dvě instrukce více
+
 ### Test Mul
 ```c
 x = (x * 1664525u) + (i | 1u);
@@ -63,32 +65,30 @@ bench_test_mul:
 
 ### Test XOR-Shift
 ```c
-x = bench_next_rand(&x);
+x ^= x << 13;
+x ^= x >> 17;
+x ^= x << 5;
 ```
 
 #### ARM Assembly (Cortex-M33)
 ```asm
 bench_test_xor_shift:
-    push    {lr}
-    sub     sp, sp, #12
-    str     r0, [sp, #4]
-    add     r0, sp, #4
-    bl      bench_next_rand
-    add     sp, sp, #12
-    ldr     pc, [sp], #4
+    eor     r0, r0, r0, lsl #13
+    eor     r0, r0, r0, lsr #17
+    eor     r0, r0, r0, lsl #5
+    bx      lr
 ```
 
 #### RISC-V Assembly (Hazard3)
 ```asm
 bench_test_xor_shift:
-    addi    sp,sp,-32
-    sw      a0,12(sp)
-    addi    a0,sp,12
-    sw      ra,28(sp)
-    call    bench_next_rand
-    lw      ra,28(sp)
-    addi    sp,sp,32
-    jr      ra
+    slli    a5,a0,13
+    xor     a5,a5,a0
+    srli    a0,a5,17
+    xor     a0,a0,a5
+    slli    a5,a0,5
+    xor     a0,a5,a0
+    ret
 ```
 
 ### Test Div
